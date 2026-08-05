@@ -230,11 +230,16 @@ Two independent layers stop two ticks from mutating the same project:
    file additionally guarantees only one scheduler sweep runs at a time across
    processes. Interval jobs also schedule the next fire off completion, so the 2h
    cadence is from-finish, not wall-clock.
-2. **Atomic project lock.** `research_project.py tick <dir>` acquires an exclusive
-   `flock` on `<proj>/.research/.lock` for the whole tick (dig + checkpoint); a second
-   `tick` on the same project exits code 2 ("skipped — locked") rather than corrupting
-   state. This also protects against a *manual* run colliding with a cron run, which
-   the scheduler guard cannot see (they're different processes).
+2. **Per-mutation project lock (Design 2).** Every shared-state write goes through a
+   CLI command that acquires an exclusive `flock` on `<proj>/.research/.lock` for that
+   single operation: `source add`, `claim add`, `frontier add`/`update`, `edge`,
+   `resignal`, `checkpoint`, and `tick`. The agent's browsing (web search / extraction)
+   is NOT wrapped in a single whole-session flock (Hermes tool calls are not shell
+   commands inside `subprocess.run`); instead, the lock is held per state mutation, so
+   `sources.jsonl` / `claims.jsonl` / `frontier.jsonl` / `state.json` / `edges.jsonl`
+   are always written by a serialized critical section. A locked command that finds the
+   project already locked exits code 2 ("locked") without mutating anything. This also
+   protects a manual run colliding with a cron run (different processes).
 
 Layer 1 is the primary overlap guard; layer 2 is belt-and-suspenders for the project's
 own state files.
@@ -323,13 +328,18 @@ Self-contained prompt template (adjust `<PLACEHOLDERS>`):
 Run one research tick on this project per the HERMES.md protocol and the
 endless-research skill. Objective: .research/objective.md.
 
-0. You MUST execute your whole tick inside the atomic lock primitive so two
-   runs can never collide:
-   `python3 ~/.hermes/skills/research/endless-research/scripts/research_project.py
-   tick . --cmd "echo tick" ` would be a lock-wrapped run; for real digging,
-   run `tick . --cmd '<your dig> '` or, if doing the dig yourself in tools,
-   first acquire/release the lock around your state writes. If `tick` returns
-   exit code 2 (locked), a prior run is still going — stop cleanly.
+0. CONCURRENCY (Design 2): perform EVERY shared-state write through a lock-protected
+   CLI command. NEVER edit any .research/*.jsonl or state.json with a text editor / raw
+   write. Locked write primitives (each acquires <proj>/.research/.lock):
+     research_project.py source   add <dir> --url U [--title T] ...
+     research_project.py claim    add <dir> --claim "..." --sources SRC-1,SRC-2 ...
+     research_project.py frontier add <dir> --description "..." [--parent SRC-1]
+     research_project.py frontier update <dir> <CLUE-ID> [--status ...] [--attempt]
+     research_project.py edge <dir> <from> <relationship> <to> [--context "..."]
+     research_project.py resignal <dir> <STATE> [--note "..."] [--cron <id>]
+     research_project.py checkpoint <dir> [--note "..."]
+   Browsing (web search/extract) does NOT need wrapping. If a locked command exits
+   code 2, the project is locked by a prior run — skip that write / stop cleanly.
 
 1. Read .research/state.json. If current_state is SUCCESS, EXHAUSTED, or DORMANT,
    STOP and report that verdict — do not continue digging. (SUCCESS/EXHAUSTED are
@@ -337,18 +347,20 @@ endless-research skill. Objective: .research/objective.md.
    may reopen later; it stays silent/armed until resignalled to CONTINUE.)
 2. Resume the highest-priority PENDING frontier clue (use
    `python3 .../research_project.py status .` for the deterministic sort).
-3. Dig with search/extract, record sources + claims. If you find the answer and it
-   satisfies the objective's SUCCESS criteria with traceable evidence and no material
-   contradiction, set state to SUCCESS and write .research/final-report.md.
-4. Otherwise, enqueue quality-gated new clues, log queries, re-prioritise, take a
-   checkpoint (the `tick` wrapper auto-checkpoints), and leave state as CONTINUE
-   (or BLOCKED/DORMANT/EXHAUSTED only if genuinely appropriate).
+3. Dig with search/extract; register sources (`source add`), create edges (`edge`),
+   record claims (`claim add`). If you find the answer and it satisfies the objective's
+   SUCCESS criteria with traceable evidence and no material contradiction, run
+   `verify_success .` (must be UNBLOCKED), then `resignal . SUCCESS --cron <id>` and
+   write .research/final-report.md.
+4. Otherwise, `frontier add` quality-gated new clues, log queries, `checkpoint .`, and
+   leave state as CONTINUE (or BLOCKED/DORMANT/EXHAUSTED only if genuinely appropriate)
+   via `resignal . <STATE>`.
 5. Deliver a short progress note: current state, what was checked this tick, the new
    frontier summary, and the next clue to investigate.
 
 Rules: never fabricate a citation/URL. Multiple pages citing the same original are not
-independent confirmation. Never declare SUCCESS just because you searched a lot. Do not
-schedule or touch other cron jobs.
+independent confirmation. Never declare SUCCESS just because you searched a lot. Never
+claim "engine success == research success". Do not edit or schedule other cron jobs.
 ```
 
 ### Cron invariants to respect

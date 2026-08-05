@@ -6,6 +6,26 @@ adheres to [Semantic Versioning](https://semver.org/) (with `v0.x` pre-1.0 seman
 
 ## [Unreleased]
 
+## [0.2.2] — 2026-08-05
+### Added (Design 2: lock every shared-state write)
+- **Locked mutation primitives.** New `source add`, `claim add`, `frontier add`,
+  `frontier update` CLI commands — each holds the project flock for the write, so a
+  shared-state mutation is a single serialized critical section even though the agent's
+  browser/web tool calls are not wrapped.
+- `resignal` and `checkpoint` now also hold the project lock for their `state.json` /
+  checkpoint-file writes (the cron pause/resume subprocess runs outside the lock).
+- This closes the "full-session lock" gap: instead of trying to wrap the whole Hermes
+  agent session in one flock (which `subprocess.run(shell=True)` cannot do for web tool
+  calls), DESIGN 2 guarantees every mutation of shared state is flock-guarded. The
+  engine's own scheduler in-flight guard + these per-mutation locks provide the safety.
+- **Tests:** new `test_locked_mutations.py` (5 tests) — locked source/claim/frontier
+  adds, concurrent serialization, lock-contention exit code. Suite: 51 → **56 tests**.
+
+### Changed
+- `research-cron-prompt.md` rewritten to Design 2: the agent must route ALL file/state
+  writes through locked CLI commands and never hand-edit the `.research/*.jsonl` /
+  state.json files. The prompt no longer claims a single whole-session flock.
+
 ## [0.2.1] — 2026-08-05
 
 ### Added

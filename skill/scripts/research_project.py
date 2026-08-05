@@ -394,23 +394,29 @@ def cmd_resignal(args) -> int:
             return 1
         print()
 
-    state = json.loads(state_f.read_text())
-    prev = state.get("current_state", "CONTINUE")
-    state["current_state"] = st
-    state["state_updated"] = _now()
-    if args.note:
-        state["next_action"] = args.note
-        if st == "BLOCKED":
-            bl = state.setdefault("blockers", [])
-            if args.note not in bl:
-                bl.append(args.note)
-    state_f.write_text(json.dumps(state, indent=2))
+    # Read-modify-write state.json while holding the project lock (Design 2).
+    try:
+        with _project_lock(proj, timeout=max(1.0, float(getattr(args, "lock_timeout", 10)))):
+            state = json.loads(state_f.read_text())
+            prev = state.get("current_state", "CONTINUE")
+            state["current_state"] = st
+            state["state_updated"] = _now()
+            if args.note:
+                state["next_action"] = args.note
+                if st == "BLOCKED":
+                    bl = state.setdefault("blockers", [])
+                    if args.note not in bl:
+                        bl.append(args.note)
+            state_f.write_text(json.dumps(state, indent=2))
+    except BlockingIOError:
+        print("Project locked by another researcher — state not changed.", file=sys.stderr)
+        return 2
     print(f"State set to {st}.")
 
     # Deterministic cron self-(dis)arming on terminal vs resumable transitions.
     # The research cron fires only while state ∈ CRON_RUN_STATES; it pauses when
     # state ∈ CRON_PAUSE_STATES (SUCCESS/EXHAUSTED = done; DORMANT = parked until
-    # the watcher re-awakens).
+    # the watcher re-awakens). Runs OUTSIDE the project lock (separate subsystem).
     if args.cron:
         if st in CRON_PAUSE_STATES and prev in CRON_RUN_STATES:
             _pause_cron_job(args.cron)          # entered a pause state -> stop firing
@@ -459,12 +465,18 @@ def cmd_checkpoint(args) -> int:
         return 1
     ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S_%f")  # microsecond suffix avoids same-second collisions
     cp = research / "checkpoints" / f"cp_{ts}.md"
-    state = json.loads(state_f.read_text())
-    body = f"# Checkpoint {ts}\n\nstate       : {state.get('current_state')}\n"
-    body += f"next_action : {state.get('next_action')}\nnote        : {args.note or ''}\n"
-    cp.write_text(body)
-    state["last_checkpoint"] = str(cp.relative_to(research))
-    state_f.write_text(json.dumps(state, indent=2))
+    # Read-modify-write state.json + checkpoint file under the project lock (Design 2).
+    try:
+        with _project_lock(proj, timeout=max(1.0, float(getattr(args, "lock_timeout", 10)))):
+            state = json.loads(state_f.read_text())
+            body = f"# Checkpoint {ts}\n\nstate       : {state.get('current_state')}\n"
+            body += f"next_action : {state.get('next_action')}\nnote        : {args.note or ''}\n"
+            cp.write_text(body)
+            state["last_checkpoint"] = str(cp.relative_to(research))
+            state_f.write_text(json.dumps(state, indent=2))
+    except BlockingIOError:
+        print("Project locked by another researcher — checkpoint skipped.", file=sys.stderr)
+        return 2
     print(f"Checkpoint written: {cp}")
     return 0
 
@@ -827,6 +839,134 @@ def cmd_edge(args) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# Locked mutation primitives (Design 2: lock every shared-state write)
+# ---------------------------------------------------------------------------
+# These make the flock cover ALL mutations of the project files, so even though the
+# agent's browsing (web tool calls) is not itself wrapped in a flock, any write to
+# sources.jsonl / claims.jsonl / frontier.jsonl / state.json / edges.jsonl is
+# serialized by the project lock. This is the crash-resistant design: a state-changing
+# operation is a single locked CLI call.
+
+def _locked_append(args, fname: str, node: dict, label: str) -> int:
+    """Append `node` to `.research/<fname>` under the project lock."""
+    proj = Path(args.dir).expanduser().resolve()
+    research = proj / ".research"
+    if not (research / "state.json").exists():
+        print("No state.json. Run `init` first.", file=sys.stderr)
+        return 1
+    try:
+        with _project_lock(proj, timeout=max(1.0, float(getattr(args, "lock_timeout", 10)))):
+            with open(research / fname, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(node) + "\n")
+    except BlockingIOError:
+        print(f"Project locked by another researcher — {label} not added.", file=sys.stderr)
+        return 2
+    print(f"Added {node.get('id', 'record')} to {fname} (locked)")
+    return 0
+
+
+def _mint_id(research: Path, fname: str, prefix: str) -> str:
+    existing = {n.get("id") for n in _load_jsonl(research / fname)}
+    i = 1
+    while True:
+        cand = f"{prefix}-{i:04d}"
+        if cand not in existing:
+            return cand
+        i += 1
+
+
+def cmd_source_add(args) -> int:
+    """Append a source node (SRC-*) to sources.jsonl UNDER THE PROJECT LOCK.
+
+    Every source write goes through here so the flock guards it. Keeps the original
+    url (provenance) and the canonical_url.
+    """
+    research = Path(args.dir).expanduser().resolve() / ".research"
+    sid = args.id or _mint_id(research, "sources.jsonl", "SRC")
+    canon = canonicalize_url(args.url) if args.url else None
+    node = {
+        "id": sid,
+        "url": args.url,
+        "canonical_url": canon,
+        "title": args.title or "",
+        "author": args.author,
+        "publisher": args.publisher,
+        "type": args.type or "primary_author_text",
+        "accessed": args.accessed or _now()[:10],
+        "content_fingerprint": None,
+        "note": args.note or "",
+    }
+    return _locked_append(args, "sources.jsonl", node, "source")
+
+
+def cmd_claim_add(args) -> int:
+    """Append a claim (CLM-*) to claims.jsonl UNDER THE PROJECT LOCK."""
+    research = Path(args.dir).expanduser().resolve() / ".research"
+    cid = args.id or _mint_id(research, "claims.jsonl", "CLM")
+    srcs = [s.strip() for s in (args.sources or "").split(",") if s.strip()]
+    node = {
+        "id": cid,
+        "claim": args.claim,
+        "status": args.status or "strong",
+        "confidence": args.confidence or "high",
+        "sources": srcs,
+        "technique": args.technique or "",
+        "verification_note": args.note or "",
+    }
+    return _locked_append(args, "claims.jsonl", node, "claim")
+
+
+def cmd_frontier_add(args) -> int:
+    """Append a clue (CLUE-*) to frontier.jsonl UNDER THE PROJECT LOCK."""
+    research = Path(args.dir).expanduser().resolve() / ".research"
+    cid = args.id or _mint_id(research, "frontier.jsonl", "CLUE")
+    node = {
+        "clue_id": cid,
+        "description": args.description,
+        "parent": args.parent,
+        "depth": int(args.depth or 1),
+        "relevance": int(args.relevance or 5),
+        "primary_source_likelihood": int(args.primary_likelihood or 5),
+        "info_gain": int(args.info_gain or 5),
+        "resolves_uncertainty": int(args.resolves or 5),
+        "novelty": int(args.novelty or 5),
+        "ease": int(args.ease or 5),
+        "status": "pending",
+        "attempts": 0,
+    }
+    return _locked_append(args, "frontier.jsonl", node, "clue")
+
+
+def cmd_frontier_update(args) -> int:
+    """Update a clue's status/attempts UNDER THE PROJECT LOCK."""
+    proj = Path(args.dir).expanduser().resolve()
+    research = proj / ".research"
+    if not (research / "state.json").exists():
+        print("No state.json. Run `init` first.", file=sys.stderr)
+        return 1
+    try:
+        with _project_lock(proj, timeout=max(1.0, float(getattr(args, "lock_timeout", 10)))):
+            rows = _load_jsonl(research / "frontier.jsonl")
+            hit = False
+            for r in rows:
+                if r.get("clue_id") == args.clue:
+                    if args.status:
+                        r["status"] = args.status
+                    r["attempts"] = r.get("attempts", 0) + (1 if args.attempt else 0)
+                    hit = True
+            if not hit:
+                print(f"clue {args.clue} not found", file=sys.stderr)
+                return 1
+            research.joinpath("frontier.jsonl").write_text(
+                "".join(json.dumps(r) + "\n" for r in rows))
+    except BlockingIOError:
+        print("Project locked by another researcher — frontier not updated.", file=sys.stderr)
+        return 2
+    print(f"Updated {args.clue} (status={args.status or 'unchanged'})")
+    return 0
+
+
 def cmd_graph(args) -> int:
     """Summarise the evidence graph: nodes by kind, edges by relationship.
 
@@ -1119,6 +1259,8 @@ def main(argv=None) -> int:
     pr.add_argument("--force", action="store_true",
                     help="bypass the deterministic SUCCESS gate (use only if you accept "
                          "the risk of an unverified SUCCESS)")
+    pr.add_argument("--lock-timeout", dest="lock_timeout", type=float, default=10,
+                    help="seconds to wait for the project lock (default 10)")
     pr.set_defaults(fn=cmd_resignal)
 
     prs = sub.add_parser("reset", help="re-open a project")
@@ -1131,6 +1273,7 @@ def main(argv=None) -> int:
     pc = sub.add_parser("checkpoint", help="snapshot now")
     pc.add_argument("dir")
     pc.add_argument("--note", default=None)
+    pc.add_argument("--lock-timeout", dest="lock_timeout", type=float, default=10)
     pc.set_defaults(fn=cmd_checkpoint)
 
     pt = sub.add_parser("tick", help="run ONE research tick under the atomic project lock")
@@ -1179,6 +1322,62 @@ def main(argv=None) -> int:
                      help="clear -> compile; vague -> defaults; ambiguous -> ask questions")
     pc2.add_argument("--no-write", action="store_true", help="do not overwrite objective.md")
     pc2.set_defaults(fn=cmd_clarify)
+
+    # --- v0.2.2 locked mutation primitives (Design 2) ---
+    # source / claim / frontier writes all acquire the project lock, so every
+    # shared-state mutation is flock-guarded even if browsing is not wrapped.
+    psrc = sub.add_parser("source", help="add a source node (SRC-*) — LOCKED write")
+    psrc_sub = psrc.add_subparsers(dest="op", required=True)
+    psrc_a = psrc_sub.add_parser("add", help="append a source")
+    psrc_a.add_argument("dir")
+    psrc_a.add_argument("--url", required=True)
+    psrc_a.add_argument("--title", default=None)
+    psrc_a.add_argument("--author", default=None)
+    psrc_a.add_argument("--publisher", default=None)
+    psrc_a.add_argument("--type", default=None)
+    psrc_a.add_argument("--id", default=None)
+    psrc_a.add_argument("--accessed", default=None)
+    psrc_a.add_argument("--note", default=None)
+    psrc_a.add_argument("--lock-timeout", dest="lock_timeout", type=float, default=10)
+    psrc_a.set_defaults(fn=cmd_source_add)
+
+    pcl = sub.add_parser("claim", help="add a claim node (CLM-*) — LOCKED write")
+    pcl_sub = pcl.add_subparsers(dest="op", required=True)
+    pcl_a = pcl_sub.add_parser("add", help="append a claim")
+    pcl_a.add_argument("dir")
+    pcl_a.add_argument("--claim", required=True)
+    pcl_a.add_argument("--sources", default=None, help="comma-separated source ids")
+    pcl_a.add_argument("--status", default=None)
+    pcl_a.add_argument("--confidence", default=None)
+    pcl_a.add_argument("--technique", default=None)
+    pcl_a.add_argument("--id", default=None)
+    pcl_a.add_argument("--note", default=None)
+    pcl_a.add_argument("--lock-timeout", dest="lock_timeout", type=float, default=10)
+    pcl_a.set_defaults(fn=cmd_claim_add)
+
+    pfr = sub.add_parser("frontier", help="add/update frontier clues — LOCKED writes")
+    pfr_sub = pfr.add_subparsers(dest="op", required=True)
+    pfr_a = pfr_sub.add_parser("add", help="append a clue")
+    pfr_a.add_argument("dir")
+    pfr_a.add_argument("--description", required=True)
+    pfr_a.add_argument("--parent", default=None)
+    pfr_a.add_argument("--id", default=None)
+    pfr_a.add_argument("--depth", default=1)
+    pfr_a.add_argument("--relevance", default=5)
+    pfr_a.add_argument("--primary-likelihood", default=5)
+    pfr_a.add_argument("--info-gain", default=5)
+    pfr_a.add_argument("--resolves", default=5)
+    pfr_a.add_argument("--novelty", default=5)
+    pfr_a.add_argument("--ease", default=5)
+    pfr_a.add_argument("--lock-timeout", dest="lock_timeout", type=float, default=10)
+    pfr_a.set_defaults(fn=cmd_frontier_add)
+    pfr_u = pfr_sub.add_parser("update", help="update a clue status/attempts")
+    pfr_u.add_argument("dir")
+    pfr_u.add_argument("clue")
+    pfr_u.add_argument("--status", default=None)
+    pfr_u.add_argument("--attempt", action="store_true")
+    pfr_u.add_argument("--lock-timeout", dest="lock_timeout", type=float, default=10)
+    pfr_u.set_defaults(fn=cmd_frontier_update)
 
     args = p.parse_args(argv)
     return args.fn(args)
