@@ -113,7 +113,7 @@ def check(proj: Path) -> int:
     return 0
 
 
-def release(proj: Path, run_id: str | None) -> int:
+def release(proj: Path, run_id: "str | None" = None) -> int:
     research = proj / ".research"
     lease_file = research / ".worker-lease.json"
     try:
