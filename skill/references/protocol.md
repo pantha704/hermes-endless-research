@@ -54,9 +54,13 @@ evidence graph.
 
 - **`inspect <dir> <url>`** — shows the canonical URL, a content fingerprint, and the
   campaign scope rules, *before any fetching*. Run this before deciding to dig.
-- **URL canonicalisation** (`canonicalize_url`): strips fragments, drops tracking params
-  (`utm_*`, `fbclid`, `gclid`, `ref`, ...), normalises `www.`, drops empty params,
-  sorts remaining params. Tracking variants collapse to one identity.
+- **URL canonicalisation** (`canonicalize_url`) — **conservative by default**:
+  always strips only `utm_*`, `fbclid`, `gclid`; strips the fragment; sorts remaining
+  params. It does NOT strip `www.` or `ref`/`source`/`from`/`share` by default (those
+  can be semantically meaningful on some sites, so stripping them could merge distinct
+  pages). Opt into stronger collapsing (`strip_www`, `conditional_params`) only when
+  you have verified the domain's semantics. Always keep the originally-encountered URL
+  (`url`) alongside the canonical form (`canonical_url`) for provenance.
 - **Content fingerprinting** (`content_fingerprint`): a `sha256:` hash of whitespace-
   normalised text for duplicate detection (`duplicate_of` / `archived_version_of` edges).
 

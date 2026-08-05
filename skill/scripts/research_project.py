@@ -880,16 +880,50 @@ def cmd_graph(args) -> int:
 
 _FRAGMENT_ONLY = re.compile(r"^#")
 
+# Parameters that are ALWAYS safe to strip — universally recognised tracking markers.
+# These are unambiguous across sites. Do NOT add ref/source/from/share here: on some
+# sites those values are semantically meaningful (routing, campaign identity, content
+# selection), so stripping them could merge genuinely different pages.
+_ALWAYS_STRIP_TRACKING = {
+    "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
+    "utm_id", "utm_campaignid", "fbclid", "gclid",
+}
 
-def canonicalize_url(url: str) -> str:
-    """Canonicalise a URL so tracking/boilerplate variants map to one form.
+# Parameters that are USUALLY tracking but CAN be semantic on some sites. We do NOT
+# remove these by default; they are only stripped when explicitly enabled via
+# `aggressive=True` / scope policy. Their presence must not force two different pages
+# to collide.
+_CONDITIONALLY_TRACKING = {"ref", "source", "from", "share", "spm", "mc_cid", "igshid"}
 
-    - strips the fragment
-    - drops known-tracking query params
-    - normalises www.
-    - strips empty query params
-    - sorts remaining query params for stable identity
-    Note: DOES NOT normalise trailing slashes (path identity is intentional here).
+
+def canonicalize_url(
+    url: str,
+    *,
+    strip_www: bool = False,
+    conditional_params: frozenset = frozenset(),
+) -> str:
+    """Canonicize a URL CONSERVATIVELY for duplicate detection.
+
+    Default behaviour (safe on any site):
+      - strips the URL fragment
+      - always drops only the universally-safe tracking params (utm_*, fbclid, gclid)
+      - strips empty query params
+      - sorts remaining params for stable identity
+      - lowercases scheme + host (case-insensitive host)
+
+    It does NOT, by default:
+      - strip ``www.`` (www.example.com and example.com can be different sites),
+      - strip ``ref``/``source``/``from``/``share`` (semantically meaningful on some
+        sites; a different value can mean different content),
+      - normalise trailing slashes (path identity is intentional).
+
+    To opt into stronger collapsing (used only for genuinely duplicate-detection where
+    the operator has verified domain semantics), pass ``strip_www=True`` and/or put
+    ``ref``/``source``/``from``/``share`` in ``conditional_params``.
+
+    Provenance: because canonicalization intentionally loses information, callers that
+    store a source SHOULD keep the originally-encountered URL alongside the canonical
+    form (e.g. ``url`` + ``canonical_url``), never replace the original.
     """
     if not url:
         return url
@@ -900,17 +934,16 @@ def canonicalize_url(url: str) -> str:
         p = urlparse(url)
     except ValueError:
         return url
-    # lowercase scheme+netloc for identity stability
+
     scheme = (p.scheme or "").lower()
     netloc = (p.netloc or "").lower()
-    if netloc.startswith("www."):
+    if strip_www and netloc.startswith("www."):
         netloc = netloc[4:]
-    # strip tracking/fragile query params
-    TRACKING = {"utm_source", "utm_medium", "utm_campaign", "utm_term",
-                "utm_content", "fbclid", "gclid", "mc_cid", "igshid",
-                "ref", "spm", "from", "share"}
+
+    # Never drop the semantically-meaningful params unless explicitly enabled.
+    to_strip = set(_ALWAYS_STRIP_TRACKING) | set(conditional_params)
     qs = [(k, v) for k, v in parse_qsl(p.query, keep_blank_values=True)
-          if k not in TRACKING and v != ""]
+          if k not in to_strip and v != ""]
     qs.sort()
     query = urlencode(qs)
     path = p.path or "/"

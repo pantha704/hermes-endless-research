@@ -6,6 +6,35 @@ adheres to [Semantic Versioning](https://semver.org/) (with `v0.x` pre-1.0 seman
 
 ## [Unreleased]
 
+## [0.2.1] — 2026-08-05
+
+### Added
+- **Atomic node+edge creation under the project lock** — creating a question/person
+  node and its relationship edge is an all-or-nothing operation, so the graph can
+  never hold a dangling reference. The old `Q-`/`P-` referential-integrity exemption is
+  removed.
+- **Dedicated automated tests** for the atomic-edge contract (rollback, concurrent
+  creation, both-endpoints-missing, existing/question-id reuse, `supports`→claim rule,
+  graph validation). Suite: 38 → **51 tests**. (The earlier commit only shipped the
+  script change; now it is protected by tests.)
+
+### Changed
+- **Conservative URL canonicalisation.** `canonicalize_url` now ALWAYS strips only
+  `utm_*`, `fbclid`, `gclid`; it does NOT strip `www.` or `ref`/`source`/`from`/`share`
+  by default (those can be semantically meaningful on some sites and must not cause
+  different pages to collide). Opt-in flags `strip_www` / `conditional_params` are
+  available for verified duplicate detection, and provenance keeps the original URL.
+
+### Removed
+- `templates/cron-prompt.md` (combined research + watcher) → **split** into
+  `templates/research-cron-prompt.md` and `templates/dormant-watcher-prompt.md` so a job
+  can never accidentally receive both instructions. README + protocol updated to the
+  split prompts.
+
+### Fixed
+- v0.2.0 tag predated the atomic-edge commit. **v0.2.1** now carries the atomic-edge +
+  conservative-canonicalisation changes so the release tarball reflects `main`.
+
 ## [0.2.0] — 2026-08-05
 
 ### Added (data-layer upgrade — keeps the whole engine; no redesign/Neo4j)

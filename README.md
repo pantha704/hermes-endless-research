@@ -96,8 +96,9 @@ evidence trail passes.
 endless-research status ~/research/my-campaign
 ```
 
-**4. Schedule the two cron jobs** (see `templates/cron-prompt.md` for ready-to-paste
-prompts):
+**4. Schedule the two cron jobs** (see the **separate** ready-to-paste prompts,
+`templates/research-cron-prompt.md` and `templates/dormant-watcher-prompt.md` — do NOT
+combine both into one job):
 
 - **Job 1 — research digger:** `every 2h`, fires on `CONTINUE/CHECKPOINT/BLOCKED`,
   auto-pauses on `DORMANT/SUCCESS/EXHAUSTED`.
@@ -107,10 +108,15 @@ prompts):
 Example scheduling with Hermes:
 
 ```bash
-# Job 1 (research)
+# Job 1 (research) — research-only prompt
 hermes cron add --every 2h --name "my-campaign research" \
   --workdir "$HOME/research/my-campaign" \
-  --skills endless-research --prompt "$(cat templates/cron-prompt.md)"
+  --skills endless-research --prompt "$(cat templates/research-cron-prompt.md)"
+
+# Job 2 (dormant watcher) — watcher-only prompt
+hermes cron add --every 12h --name "my-campaign dormant-watcher" \
+  --workdir "$HOME/research/my-campaign" \
+  --skills endless-research --prompt "$(cat templates/dormant-watcher-prompt.md)"
 ```
 
 See the **full example project** in `examples/demo-project/`.
