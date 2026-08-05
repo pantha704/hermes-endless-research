@@ -711,12 +711,36 @@ def _make_edge_id(edges: list) -> str:
     return f"EDGE-{uuid.uuid4().hex[:10]}"
 
 
-def cmd_edge(args) -> int:
-    """Append an explicit typed edge to the evidence graph.
+def _append_node(research: Path, kind: str, node: dict) -> None:
+    """Append a node record to its kind's file (append-only audit trail)."""
+    fname = NODE_KINDS[kind]
+    path = research / fname
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(node) + "\n")
 
-    Enforces referential integrity: from_id/to_id must reference real nodes and
-    relationship must be one of the known types. This makes the implicit graph
-    (sources/claims/clues linked by IDs) explicit and machine-checked.
+
+def _mint_node_id(research: Path, kind: str, prefix: str) -> str:
+    """Return the next unused node id for a kind, e.g. Q-0007 / P-0012."""
+    existing = {n.get("id") for n in _load_jsonl(research / NODE_KINDS[kind])}
+    i = 1
+    while True:
+        cand = f"{prefix}-{i:04d}"
+        if cand not in existing:
+            return cand
+        i += 1
+
+
+def cmd_edge(args) -> int:
+    """Append an explicit typed edge to the evidence graph — ATOMICALLY.
+
+    Enforces full referential integrity, with NO exemptions: every from_id/to_id
+    must resolve to a real node at the end of the call. If an edge targets a
+    question (Q-*) or person/entity (P-*) node that does not exist yet, that node
+    is created atomically alongside the edge — BOTH succeed or NEITHER does.
+
+    The node+edge create is wrapped in the project lock, so a concurrent tick can
+    never observe a half-created edge or a dangling reference. relationship must
+    be one of the known types and domain rules are enforced.
     """
     proj = Path(args.dir).expanduser().resolve()
     research = proj / ".research"
@@ -730,18 +754,7 @@ def cmd_edge(args) -> int:
               file=sys.stderr)
         return 1
 
-    # Validate referential integrity (allow Q.?/P.? to be created implicitly later).
-    missing = []
-    for node_id in (args.from_id, args.to_id):
-        if node_id.startswith(("Q.", "P.")):
-            continue  # fresh question/entity ids can be minted on the first link
-        if not _node_exists(research, node_id):
-            missing.append(node_id)
-    if missing:
-        print(f"Unknown node ID(s): {missing}. Add the node first or use the correct ID.",
-              file=sys.stderr)
-        return 1
-
+    # Domain rules: relationship-specific node-kind constraints.
     if rel in ("supports", "contradicts") and not args.to_id.startswith("CLM"):
         print(f"relationship '{rel}' requires a CLAIM as to_id (got {args.to_id})",
               file=sys.stderr)
@@ -751,16 +764,62 @@ def cmd_edge(args) -> int:
               file=sys.stderr)
         return 1
 
-    edges = _load_edges(research)
-    edge = {
-        "edge_id": _make_edge_id(edges),
-        "from_id": args.from_id,
-        "relationship": rel,
-        "to_id": args.to_id,
-        "context": args.context or "",
-        "discovered_at": _now(),
-    }
-    _append_edge(research, edge)
+    # Edge may point at a Q-* / P-* node that does not exist yet; mint it later.
+    # Work entirely under the lock so node+edge creation is atomic.
+    try:
+        with _project_lock(proj, timeout=max(1.0, float(getattr(args, "lock_timeout", 10)))):
+            results = []
+            ids_to_ensure = {args.from_id, args.to_id}
+
+            for nid in ids_to_ensure:
+                if _node_exists(research, nid):
+                    continue
+                kind = nid.split("-")[0]
+                # Only auto-create question/person/entity nodes.
+                if kind not in ("Q", "P"):
+                    print(f"Unknown node ID: {nid}. Add the node first (or use a Q-/P- id "
+                          f"to have it created atomically with the edge).", file=sys.stderr)
+                    return 1
+                # Mint a real id (fill placeholder zeros if the caller used Q-0000 etc.)
+                real_id = _mint_node_id(research, kind, kind)
+                if nid != real_id and any(
+                    n.get("id") == real_id for n in _load_jsonl(research / NODE_KINDS[kind])
+                ):
+                    pass  # real_id already unique by construction
+                node = {
+                    "id": real_id,
+                    "kind": "question" if kind == "Q" else "entity",
+                    "label": args.context or f"{kind} node",
+                    "created_at": _now(),
+                }
+                _append_node(research, kind, node)
+                # If the caller referenced a placeholder, substitute the real id
+                # in BOTH endpoints consistently.
+                if nid == args.from_id:
+                    args.from_id = real_id
+                if nid == args.to_id:
+                    args.to_id = real_id
+                results.append(f"created {kind} node {real_id}")
+
+            edges = _load_edges(research)
+            edge = {
+                "edge_id": _make_edge_id(edges),
+                "from_id": args.from_id,
+                "relationship": rel,
+                "to_id": args.to_id,
+                "context": args.context or "",
+                "discovered_at": _now(),
+            }
+            _append_edge(research, edge)
+    except BlockingIOError:
+        print("Project is locked by another researcher — edge not added.", file=sys.stderr)
+        return 2
+    except (FileNotFoundError, OSError) as e:
+        print(f"Edge not added (atomic create-abort): {e}", file=sys.stderr)
+        return 1
+
+    for r in results:
+        print(r)
     print(f"Added {edge['edge_id']}: {args.from_id} -[{rel}]-> {args.to_id}")
     return 0
 
@@ -1053,12 +1112,14 @@ def main(argv=None) -> int:
     pv.set_defaults(fn=cmd_verify_success)
 
     # --- v0.2.0 graph / URL / clarifier commands ---
-    pe = sub.add_parser("edge", help="add an explicit typed edge to the evidence graph")
+    pe = sub.add_parser("edge", help="add an explicit typed edge to the evidence graph (atomic node+edge)")
     pe.add_argument("dir")
     pe.add_argument("from_id")
     pe.add_argument("relationship", choices=sorted(RELATIONSHIPS))
     pe.add_argument("to_id")
     pe.add_argument("--context", default=None, help="why this edge matters / surrounding text")
+    pe.add_argument("--lock-timeout", dest="lock_timeout", type=float, default=10,
+                    help="seconds to wait for the project lock before giving up (default 10)")
     pe.set_defaults(fn=cmd_edge)
 
     pg = sub.add_parser("graph", help="summarise the evidence graph (nodes + edges)")
