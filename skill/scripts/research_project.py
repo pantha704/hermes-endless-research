@@ -771,21 +771,24 @@ def cmd_edge(args) -> int:
             results = []
             ids_to_ensure = {args.from_id, args.to_id}
 
+            # PHASE 1 — validate. Every non-Q/P endpoint must already exist; if any
+            # is missing, abort BEFORE creating anything (true atomicity). Only Q-/P-
+            # endpoints may be auto-created, and only once all existing nodes check out.
             for nid in ids_to_ensure:
                 if _node_exists(research, nid):
                     continue
                 kind = nid.split("-")[0]
-                # Only auto-create question/person/entity nodes.
                 if kind not in ("Q", "P"):
                     print(f"Unknown node ID: {nid}. Add the node first (or use a Q-/P- id "
                           f"to have it created atomically with the edge).", file=sys.stderr)
-                    return 1
-                # Mint a real id (fill placeholder zeros if the caller used Q-0000 etc.)
+                    return 1  # nothing has been created yet -> atomic abort
+
+            # PHASE 2 — create missing Q-/P- nodes (all validation passed).
+            for nid in ids_to_ensure:
+                if _node_exists(research, nid):
+                    continue
+                kind = nid.split("-")[0]
                 real_id = _mint_node_id(research, kind, kind)
-                if nid != real_id and any(
-                    n.get("id") == real_id for n in _load_jsonl(research / NODE_KINDS[kind])
-                ):
-                    pass  # real_id already unique by construction
                 node = {
                     "id": real_id,
                     "kind": "question" if kind == "Q" else "entity",
@@ -793,14 +796,14 @@ def cmd_edge(args) -> int:
                     "created_at": _now(),
                 }
                 _append_node(research, kind, node)
-                # If the caller referenced a placeholder, substitute the real id
-                # in BOTH endpoints consistently.
+                # Substitute the real id in BOTH endpoints consistently.
                 if nid == args.from_id:
                     args.from_id = real_id
                 if nid == args.to_id:
                     args.to_id = real_id
                 results.append(f"created {kind} node {real_id}")
 
+            # PHASE 3 — append the edge (both endpoints now resolve to real nodes).
             edges = _load_edges(research)
             edge = {
                 "edge_id": _make_edge_id(edges),
