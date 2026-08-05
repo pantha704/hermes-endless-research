@@ -10,7 +10,6 @@ import research_project as rp
 
 SCRIPT = Path(__file__).resolve().parent.parent / "skill" / "scripts" / "research_project.py"
 GATE = Path(__file__).resolve().parent.parent / "scripts" / "campaign-lease-gate.py"
-HERMES_SCRIPTS = Path(os.path.expanduser("~/.hermes/scripts"))
 
 
 def _cli(*args):
@@ -36,30 +35,37 @@ def _acquire(project):
 
 # --- cron-wrapper ---
 
-def test_cron_wrapper_generates_absolute_path_wrapper(project):
-    rc, out, err = _cli("cron-wrapper", project, "--name", "cfg")
+def _wrap_cli(project, *args, scripts_dir):
+    env = dict(os.environ)
+    env["ENDLESS_SCRIPTS_DIR"] = str(scripts_dir)
+    r = subprocess.run([sys.executable, str(SCRIPT), *args], capture_output=True,
+                       text=True, env=env)
+    return r.returncode, r.stdout, r.stderr
+
+
+def test_cron_wrapper_generates_absolute_path_wrapper(project, tmp_path):
+    rc, out, err = _wrap_cli(project, "cron-wrapper", project, "--name", "cfg",
+                             scripts_dir=tmp_path)
     assert rc == 0, err
-    wrapper = HERMES_SCRIPTS / "cfg-lease-gate.sh"
+    wrapper = tmp_path / "cfg-lease-gate.sh"
     assert wrapper.exists()
     text = wrapper.read_text()
     assert str(project) in text        # absolute project path baked in
     assert "CHECK" in text
     assert "campaign-lease-gate.py" in text
-    # cleanup
-    wrapper.unlink(missing_ok=True)
 
 
-def test_cron_wrapper_works_from_arbitrary_cwd(project):
+def test_cron_wrapper_works_from_arbitrary_cwd(project, tmp_path):
     # Simulate Hermes running the gate from the scripts dir (not the workdir).
-    rc, out, err = _cli("cron-wrapper", project, "--name", "cwdtest")
+    rc, out, err = _wrap_cli(project, "cron-wrapper", project, "--name", "cwdtest",
+                             scripts_dir=tmp_path)
     assert rc == 0
-    wrapper = HERMES_SCRIPTS / "cwdtest-lease-gate.sh"
+    wrapper = tmp_path / "cwdtest-lease-gate.sh"
     assert wrapper.exists()
     # run it from a different cwd; it must still find the project and wake the agent.
     r = subprocess.run(["bash", str(wrapper)], cwd="/tmp", capture_output=True, text=True)
     assert r.returncode == 0
     assert '"run_id":' in r.stdout      # found the campaign despite cwd
-    wrapper.unlink(missing_ok=True)
 
 
 # --- strict lease ownership on mutations ---

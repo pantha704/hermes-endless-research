@@ -1173,7 +1173,10 @@ def cmd_cron_wrapper(args) -> int:
         print("No state.json. Run `init` first.", file=sys.stderr)
         return 1
 
-    scripts_dir = Path(os.path.expanduser("~/.hermes/scripts"))
+    # Directory for the generated wrapper. Defaults to the Hermes cron script sandbox;
+    # an operator (or tests) can redirect with ENDLESS_SCRIPTS_DIR.
+    base_dir = os.environ.get("ENDLESS_SCRIPTS_DIR") or os.path.expanduser("~/.hermes/scripts")
+    scripts_dir = Path(base_dir)
     scripts_dir.mkdir(parents=True, exist_ok=True)
     name = (args.name or proj.name or "campaign").strip()
     safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in name)
@@ -1181,7 +1184,10 @@ def cmd_cron_wrapper(args) -> int:
 
     gate_candidates = [
         Path(os.path.expanduser("~/.hermes/scripts/campaign-lease-gate.py")),
-        Path(__file__).resolve().parent.parent / "scripts" / "campaign-lease-gate.py",
+        # repo root scripts/ (skill/scripts/research_project.py -> ../../scripts)
+        Path(__file__).resolve().parent.parent.parent / "scripts" / "campaign-lease-gate.py",
+        # sibling when running the gate from the repo scripts dir
+        Path(__file__).resolve().parent / "campaign-lease-gate.py",
     ]
     gate = next((p for p in gate_candidates if p.exists()), None)
     if gate is None:
