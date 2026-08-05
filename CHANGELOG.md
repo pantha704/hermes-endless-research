@@ -6,6 +6,17 @@ adheres to [Semantic Versioning](https://semver.org/) (with `v0.x` pre-1.0 seman
 
 ## [Unreleased]
 
+## [0.2.6] — 2026-08-06
+### Fixed (edge/resignal/tick ownership — found by the real cron lifecycle test)
+The decisive real-Hermes-cron lifecycle test (gate → token → locked mutation → release)
+surfaced an integration bug the unit suite had missed: `edge` (and `resignal` and `tick`)
+called `_lease_guard` but their argparse parsers lacked `--run-id`/`--operator-override`,
+so an edge could not be written under a live worker lease. Fixed by registering the two
+flags on the `edge`, `resignal`, and `tick` subparsers. Added regression tests:
+- `test_edge_writable_under_live_lease_with_run_id`
+- `test_resignal_accepts_run_id`
+Suite: 84 → **86 tests**, all green (incl. Python 3.9 parse check).
+
 ## [0.2.5] — 2026-08-05
 ### Fixed (real Hermes cron integration + global worker contract)
 - **Per-campaign cron gate (fixes the documented command not working).** Verified in

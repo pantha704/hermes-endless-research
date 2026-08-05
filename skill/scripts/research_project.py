@@ -648,6 +648,9 @@ def cmd_tick(args) -> int:
         return 1
 
     timeout = getattr(args, "lock_timeout", 30)
+    guard = _lease_guard(args)
+    if guard:
+        return guard
     try:
         with _project_lock(proj, timeout=timeout):
             # Bump the round counter under the lock (single writer).
@@ -1529,6 +1532,9 @@ def main(argv=None) -> int:
                          "the risk of an unverified SUCCESS)")
     pr.add_argument("--lock-timeout", dest="lock_timeout", type=float, default=10,
                     help="seconds to wait for the project lock (default 10)")
+    pr.add_argument("--run-id", default=None, help="prove ownership of the active worker lease")
+    pr.add_argument("--operator-override", action="store_true",
+                    help="force a manual write despite a live lease (emergency)")
     pr.set_defaults(fn=cmd_resignal)
 
     prs = sub.add_parser("reset", help="re-open a project")
@@ -1552,6 +1558,9 @@ def main(argv=None) -> int:
     pt.add_argument("--note", default=None, help="checkpoint note for this tick")
     pt.add_argument("--lock-timeout", dest="lock_timeout", type=float, default=30,
                     help="seconds to wait for the project lock before giving up (default 30)")
+    pt.add_argument("--run-id", default=None, help="prove ownership of the active worker lease")
+    pt.add_argument("--operator-override", action="store_true",
+                    help="force a tick despite a live lease (emergency)")
     pt.set_defaults(fn=cmd_tick)
 
     pv = sub.add_parser("verify_success", help="deterministic SUCCESS gate (blocks premature SUCCESS)")
@@ -1569,6 +1578,9 @@ def main(argv=None) -> int:
     pe.add_argument("--context", default=None, help="why this edge matters / surrounding text")
     pe.add_argument("--lock-timeout", dest="lock_timeout", type=float, default=10,
                     help="seconds to wait for the project lock before giving up (default 10)")
+    pe.add_argument("--run-id", default=None, help="prove ownership of the active worker lease")
+    pe.add_argument("--operator-override", action="store_true",
+                    help="force a manual write despite a live lease (emergency)")
     pe.set_defaults(fn=cmd_edge)
 
     pg = sub.add_parser("graph", help="summarise the evidence graph (nodes + edges)")

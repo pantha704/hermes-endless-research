@@ -108,6 +108,29 @@ def test_mutation_allowed_when_no_lease(project):
     assert rc == 0, err
 
 
+def test_edge_writable_under_live_lease_with_run_id(project):
+    # Regression for the defect the real-cron run caught: `edge` must accept --run-id
+    # and be writable under a live lease (its parser previously lacked --run-id).
+    _cli("source", "add", project, "--url", "https://a.test", "--id", "SRC-A1")
+    _cli("source", "add", project, "--url", "https://b.test", "--id", "SRC-B1")
+    run_id = _acquire(project)
+    # without run-id -> refused (edge enforces the lease contract)
+    rc, out, err = _cli("edge", project, "SRC-A1", "cites", "SRC-B1")
+    assert rc == 3, err
+    # with run-id -> allowed
+    rc, out, err = _cli("edge", project, "SRC-A1", "cites", "SRC-B1", "--run-id", run_id)
+    assert rc == 0, err
+    edges = rp._load_edges(project / ".research")
+    assert len(edges) == 1
+    assert edges[0]["from_id"] == "SRC-A1" and edges[0]["to_id"] == "SRC-B1"
+
+
+def test_resignal_accepts_run_id(project, cli):
+    run_id = _acquire(project)
+    rc, out, err = _cli("resignal", project, "DORMANT", "--run-id", run_id, "--note", "n")
+    assert rc == 0, err  # resignal's parser must accept --run-id too
+
+
 # --- graph to_id audit ---
 
 def test_graph_flags_dangling_to_id(project, cli):
