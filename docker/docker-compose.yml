@@ -1,0 +1,40 @@
+# =============================================================================
+# hermes-endless-research — Docker Compose
+#
+#   Runs the official Hermes gateway with the endless-research skill layered in,
+#   plus two persistent mounts:
+#     - Hermes data  (~/.hermes  ->  /opt/data)
+#     - research projects (./research-projects -> /research)
+#
+#   Prereq: the official base image must exist as `hermes-agent` (build it from
+#   the hermes-agent repo, or pull your tag). Then:
+#
+#       docker compose -f docker/docker-compose.yml build
+#       HERMES_UID=$(id -u) HERMES_GID=$(id -g) \
+#         docker compose -f docker/docker-compose.yml up -d
+#
+#   The s6 init hook copies the skill into /opt/data/skills on first start.
+# =============================================================================
+services:
+  gateway:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: hermes-endless-research
+    container_name: hermes-endless-research
+    restart: unless-stopped
+    # The official image uses host networking so the gateway can bind to
+    # configured ports and reach local providers (e.g. a LiteLLM router).
+    network_mode: host
+    volumes:
+      # Persistent Hermes data (the engine's skill lives under /opt/data/skills)
+      - ./hermes-data:/opt/data
+      # Persistent research projects (each campaign is a subdirectory here)
+      - ./research-projects:/research
+    environment:
+      - HERMES_UID=${HERMES_UID:-10000}
+      - HERMES_GID=${HERMES_GID:-10000}
+      # Hermes home inside the container
+      - HERMES_HOME=/opt/data
+    # Command runs the official entrypoint with the gateway subcommand.
+    command: ["gateway", "run"]

@@ -1,0 +1,33 @@
+name: release
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+# Minimal release automation: on a versioned tag, create a GitHub Release
+# artifact tarball of the distributable files. Push a tag with:
+#   git tag v0.1.0-beta && git push origin v0.1.0-beta
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run tests before release
+        run: |
+          pip install pytest
+          pytest -v tests/
+      - name: Build distributable tarball
+        run: |
+          mkdir -p dist/hermes-endless-research
+          cp -r skill templates scripts docker examples tests README.md LICENSE SECURITY.md CHANGELOG.md .env.example \
+                dist/hermes-endless-research/ 2>/dev/null || true
+          tar -czf dist/hermes-endless-research.tar.gz -C dist hermes-endless-research
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/hermes-endless-research.tar.gz
+          generate_release_notes: true
+          draft: false
+          prerelease: true

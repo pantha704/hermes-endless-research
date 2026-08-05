@@ -1,0 +1,21 @@
+# ---- secrets / env ----
+.env
+*.env
+!.env.example
+
+# ---- personal research data (the external brain) ----
+# Keep generated .research state OUT of the public repo.
+**/.research/
+research-projects/
+hermes-data/
+
+# ---- python ----
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+dist/
+
+# ---- misc ----
+*.log
+.DS_Store

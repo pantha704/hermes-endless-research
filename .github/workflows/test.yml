@@ -1,0 +1,35 @@
+name: test
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.9", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install pytest
+        run: pip install pytest
+      - name: Run test suite (no network, no Hermes needed)
+        run: pytest -v tests/
+      - name: Syntax check the CLI
+        run: python3 -m py_compile skill/scripts/research_project.py
+      - name: Shell-check the installer scripts
+        run: |
+          for s in scripts/*.sh; do
+            sh -n "$s"
+            echo "syntax OK: $s"
+          done
+      - name: Verify-headless (init + tick via verify-install)
+        run: |
+          H1=$(mktemp -d)
+          HERMES_HOME="$H1/home" PREFIX="$H1" bash scripts/install.sh >/dev/null
+          HERMES_HOME="$H1/home" PREFIX="$H1" bash scripts/verify-install.sh
