@@ -9,7 +9,8 @@ The brain lives on disk in each project's `.research/` directory, so research su
 context limits, model changes, failures, restarts, and exhausted agent turns. No single
 session runs forever — **the campaign does.**
 
-`v0.1.0-beta` — experimental. Not production-verified.
+`v0.2.0` — experimental. Not production-verified. (Explicit evidence graph, URL
+intelligence + scope, and an objective clarifier added in 0.2.0.)
 
 [Install](#-install) · [Quick start](#-quick-start) · [How it works](#-how-it-works) · [Deployment](#-deployment) · [Security](#-security) · [License](#-license)
 
@@ -146,6 +147,56 @@ research job until the watcher re-awakens it) · **`SUCCESS`** (terminal, gated)
 
 **The honesty rule:** *"I searched a lot" is never SUCCESS.*
 
+### The explicit evidence graph (v0.2.0)
+
+Research is modelled as a **graph, not a linear list**. Sources, claims, clues,
+questions, people, dead-ends and contradictions are nodes; `edges.jsonl` holds typed
+relationships between them. This tells you *where something came from, what it supports,
+what contradicts it, and how things connect* — not just what was found.
+
+```bash
+# Add a typed, validated edge (referential integrity is enforced):
+endless-research edge ~/research/my-campaign SRC-001 cites SRC-002 --context "listed as original report"
+endless-research edge ~/research/my-campaign SRC-001 supports CLM-001
+endless-research edge ~/research/my-campaign SRC-002 contradicts CLM-001
+endless-research edge ~/research/my-campaign CLUE-001 derived_from SRC-002
+
+# View the graph:
+endless-research graph ~/research/my-campaign
+```
+
+Relationships: `links_to`, `cites`, `authored_by`, `published_by`, `supports`,
+`contradicts`, `answers`, `depends_on`, `derived_from`, `investigates`, `duplicate_of`,
+`archived_version_of`, `blocks`. The `edge` command rejects dangling references and
+domain violations.
+
+### URL intelligence & scope (no blind crawling)
+
+The engine is a targeted researcher, not a crawler. Per campaign `scope.json` controls
+budgets (relevance + page budget, not a strict max-depth).
+
+```bash
+# See canonical URL + fingerprint + scope BEFORE fetching:
+endless-research inspect ~/research/my-campaign "https://www.site.com/article?utm_source=x"
+```
+
+### Objective clarifier (short & smart)
+
+Turns a URL + a vague goal into a measurable research contract without over-interrupting:
+
+```bash
+endless-research clarify ~/research/my-campaign "https://site.com/ai-agent" \
+  --goal "understand how it works and whether its claims are credible"
+# A clear goal compiles the contract immediately.
+
+endless-research clarify ~/research/my-campaign "https://site.com/ai-agent" \
+  --goal "learn everything important"
+# A vague goal infers sensible defaults, records assumptions, and starts.
+
+endless-research clarify ~/research/my-campaign "https://site.com/ai-agent"
+# A materially ambiguous goal asks only the essential questions.
+```
+
 ### The SUCCESS gate
 
 `resignal <dir> SUCCESS` is automatically **blocked** unless `verify_success` confirms:
@@ -189,11 +240,12 @@ container-init hook installs the skill into the persistent volume on first start
 
 ```bash
 pip install pytest
-pytest tests/            # state machine, locking, checkpoint, success gate
+pytest tests/            # evidence graph, URL intelligence, clarifier,
+                         # state machine, locking, checkpoint, success gate
 ```
 
-CI runs the suite across Python 3.9/3.11/3.12 and shell-checks the installer on every
-push/PR, and builds a tarball prerelease on version tags.
+CI runs the suite (currently **38 tests**) across Python 3.9/3.11/3.12 and shell-checks
+the installer on every push/PR, and builds a tarball prerelease on version tags.
 
 ---
 

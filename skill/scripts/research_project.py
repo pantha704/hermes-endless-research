@@ -22,6 +22,18 @@ Commands
         Run ONE research tick under an atomic project lock, then auto-checkpoint.
         --cmd runs a subcommand (the dig work) while the lock is held; omit it
         for a no-op/dry tick. Returns exit code 2 if the project is locked.
+  verify_success <dir> [--min-corroboration N]
+        Deterministic SUCCESS gate; blocks premature SUCCESS.
+  edge <dir> <from> <relationship> <to> [--context TXT]
+        Add an explicit typed edge to the evidence graph (edges.jsonl).
+  graph <dir> [--recent N] [--no-validate]
+        Summarise the evidence graph: nodes by kind, edges by relationship.
+  inspect <dir> <url>
+        URL intelligence: canonical form + campaign scope rules (no fetching).
+  clarify <dir> <url> [--goal TXT] [--mode auto|clear|vague|ambiguous] [--no-write]
+        Objective compiler: turn a URL + vague goal into a research contract.
+        clear -> compile now; vague -> infer defaults + record assumptions;
+        ambiguous -> ask the essential 1-3 questions.
 
 States: CONTINUE | CHECKPOINT | BLOCKED | EXHAUSTED | SUCCESS | DORMANT
 
@@ -30,6 +42,12 @@ DORMANT — clues all exhausted but the topic may yield new information later
 DORMANT keeps the campaign alive to be re-awoken: resignal it back to CONTINUE
 when new information/terminology/sources emerge, so a later tick can reopen it.
 
+Evidence graph (v0.2.0): sources, claims, clues, questions, people, dead-ends and
+contradictions are NODES; edges.jsonl holds typed RELATIONSHIPS (links_to, cites,
+supports, contradicts, answers, ...) between them. The `edge` command enforces
+referential integrity (from/to must reference real nodes) so the implicit graph
+becomes explicit and machine-checkable.
+
 Exit code 0 on success, 1 on missing/corrupt project, 2 = tick skipped (locked).
 """
 
@@ -37,12 +55,16 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import json
 import os
+import re
 import sys
 import time
+import uuid
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 # Atomic project lock — fcntl on Unix, msvcrt fallback on Windows.
 try:
@@ -163,9 +185,26 @@ TEMPLATES = {
     "frontier.jsonl": "",
     "claims.jsonl": "",
     "sources.jsonl": "",
+    "edges.jsonl": "",   # explicit evidence graph: nodes linked by typed relationships
     "contradictions.jsonl": "",
     "dead-ends.jsonl": "",
     "search-log.jsonl": "",
+    "questions.jsonl": "",   # QUESTION nodes (open questions, rankable)
+    "people.jsonl": "",      # PERSON / organisation / entity nodes
+    "scope.json": """{
+  "follow_internal_links": true,
+  "follow_external_links": true,
+  "allowed_domains": [],
+  "blocked_domains": [],
+  "max_pages_per_domain": 100,
+  "relevance_budget": 100,
+  "page_budget": 200,
+  "allow_archives": true,
+  "allow_repositories": true,
+  "allow_documents": true,
+  "notes": "Budget-based crawling control; do not use a strict max_depth. See protocol.md."
+}
+""",
     "criteria.jsonl": """{"id":"C-001","description":"REPLACE — acceptance criterion.","evidence_required":"primary_or_exception","corroboration_required":true,"met":false,"evidence_source_ids":[],"exception":null}
 """,
     "unresolved.md": "# Unresolved questions\n\nRanked by importance.\n\n1. (_pending_)\n",
@@ -622,6 +661,343 @@ def cmd_tick(args) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# Explicit evidence graph (v0.2.0)
+# ---------------------------------------------------------------------------
+
+# Typed relationships between nodes. From/to IDs must reference an existing node.
+RELATIONSHIPS = {
+    "links_to", "cites", "authored_by", "published_by",
+    "supports", "contradicts", "answers", "depends_on",
+    "derived_from", "investigates", "duplicate_of", "archived_version_of",
+    "blocks",
+}
+
+# Node kinds and which files hold them (for machine-enforced referential integrity).
+NODE_KINDS = {
+    "SRC": "sources.jsonl",    # SOURCE
+    "CLM": "claims.jsonl",     # CLAIM
+    "CLUE": "frontier.jsonl",  # CLUE
+    "Q": "questions.jsonl",    # QUESTION
+    "P": "people.jsonl",       # PERSON / organisation / entity
+    "DE": "dead-ends.jsonl",   # DEAD_END
+    "X": "contradictions.jsonl",  # CONTRADICTION
+}
+
+
+def _node_exists(research: Path, node_id: str) -> bool:
+    """True if node_id resolves to an existing node in the project files."""
+    prefix = node_id.split("-")[0] if "-" in node_id else node_id
+    fname = NODE_KINDS.get(prefix)
+    if fname is None:
+        return False
+    p = research / fname
+    if not p.exists():
+        return False
+    return any(rec.get("id") == node_id for rec in _load_jsonl(p))
+
+
+def _load_edges(research: Path) -> list:
+    return _load_jsonl(research / "edges.jsonl")
+
+
+def _append_edge(research: Path, edge: dict) -> None:
+    path = research / "edges.jsonl"
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(edge) + "\n")
+
+
+def _make_edge_id(edges: list) -> str:
+    return f"EDGE-{uuid.uuid4().hex[:10]}"
+
+
+def cmd_edge(args) -> int:
+    """Append an explicit typed edge to the evidence graph.
+
+    Enforces referential integrity: from_id/to_id must reference real nodes and
+    relationship must be one of the known types. This makes the implicit graph
+    (sources/claims/clues linked by IDs) explicit and machine-checked.
+    """
+    proj = Path(args.dir).expanduser().resolve()
+    research = proj / ".research"
+    if not (research / "state.json").exists():
+        print("No state.json. Run `init` first.", file=sys.stderr)
+        return 1
+
+    rel = args.relationship.replace(" ", "_")
+    if rel not in RELATIONSHIPS:
+        print(f"Invalid relationship {rel!r}. Valid: {sorted(RELATIONSHIPS)}",
+              file=sys.stderr)
+        return 1
+
+    # Validate referential integrity (allow Q.?/P.? to be created implicitly later).
+    missing = []
+    for node_id in (args.from_id, args.to_id):
+        if node_id.startswith(("Q.", "P.")):
+            continue  # fresh question/entity ids can be minted on the first link
+        if not _node_exists(research, node_id):
+            missing.append(node_id)
+    if missing:
+        print(f"Unknown node ID(s): {missing}. Add the node first or use the correct ID.",
+              file=sys.stderr)
+        return 1
+
+    if rel in ("supports", "contradicts") and not args.to_id.startswith("CLM"):
+        print(f"relationship '{rel}' requires a CLAIM as to_id (got {args.to_id})",
+              file=sys.stderr)
+        return 1
+    if rel in ("answers",) and not args.from_id.startswith("CLM"):
+        print(f"relationship 'answers' requires a CLAIM as from_id (got {args.from_id})",
+              file=sys.stderr)
+        return 1
+
+    edges = _load_edges(research)
+    edge = {
+        "edge_id": _make_edge_id(edges),
+        "from_id": args.from_id,
+        "relationship": rel,
+        "to_id": args.to_id,
+        "context": args.context or "",
+        "discovered_at": _now(),
+    }
+    _append_edge(research, edge)
+    print(f"Added {edge['edge_id']}: {args.from_id} -[{rel}]-> {args.to_id}")
+    return 0
+
+
+def cmd_graph(args) -> int:
+    """Summarise the evidence graph: nodes by kind, edges by relationship.
+
+    This is the machine-checkable view that turns 'what was found' into 'where it
+    came from, what it supports, what contradicts it, and how things connect'.
+    """
+    proj = Path(args.dir).expanduser().resolve()
+    research = proj / ".research"
+    if not (research / "state.json").exists():
+        print("No state.json. Run `init` first.", file=sys.stderr)
+        return 1
+
+    edges = _load_edges(research)
+    print("== Graph summary ==")
+    nodes = {}
+    for kind, fname in NODE_KINDS.items():
+        n = len(_load_jsonl(research / fname))
+        if n:
+            nodes[kind] = n
+    if nodes:
+        print("  nodes:")
+        for kind, n in nodes.items():
+            print(f"    {kind:6} {n:>5}")
+    else:
+        print("  nodes: (none recorded yet)")
+
+    by_rel = {}
+    for e in edges:
+        by_rel.setdefault(e.get("relationship"), []).append(e)
+    if by_rel:
+        print("  edges:")
+        for rel in sorted(by_rel):
+            print(f"    {rel:20} {len(by_rel[rel]):>5}")
+    else:
+        print("  edges: (none recorded — use `edge` to add typed relationships)")
+
+    if args.recent:
+        print("  recent edges:")
+        for e in edges[-int(args.recent):]:
+            print(f"    {e.get('edge_id')}: {e.get('from_id')} -[{e.get('relationship')}]-> {e.get('to_id')}")
+    if not args.no_validate:
+        bad = [e for e in edges
+               if e.get("from_id") and e.get("to_id")
+               and not _node_exists(research, e["from_id"])
+               and not e["from_id"].startswith(("Q.", "P."))]
+        if bad:
+            print(f"  WARN: {len(bad)} edge(s) reference a node not yet present in the graph files.")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# URL intelligence (v0.2.0)
+# ---------------------------------------------------------------------------
+
+_FRAGMENT_ONLY = re.compile(r"^#")
+
+
+def canonicalize_url(url: str) -> str:
+    """Canonicalise a URL so tracking/boilerplate variants map to one form.
+
+    - strips the fragment
+    - drops known-tracking query params
+    - normalises www.
+    - strips empty query params
+    - sorts remaining query params for stable identity
+    Note: DOES NOT normalise trailing slashes (path identity is intentional here).
+    """
+    if not url:
+        return url
+    url = url.strip()
+    if _FRAGMENT_ONLY.match(url):
+        return url
+    try:
+        p = urlparse(url)
+    except ValueError:
+        return url
+    # lowercase scheme+netloc for identity stability
+    scheme = (p.scheme or "").lower()
+    netloc = (p.netloc or "").lower()
+    if netloc.startswith("www."):
+        netloc = netloc[4:]
+    # strip tracking/fragile query params
+    TRACKING = {"utm_source", "utm_medium", "utm_campaign", "utm_term",
+                "utm_content", "fbclid", "gclid", "mc_cid", "igshid",
+                "ref", "spm", "from", "share"}
+    qs = [(k, v) for k, v in parse_qsl(p.query, keep_blank_values=True)
+          if k not in TRACKING and v != ""]
+    qs.sort()
+    query = urlencode(qs)
+    path = p.path or "/"
+    return urlunparse((scheme, netloc, path, p.params, query, ""))
+
+
+def content_fingerprint(text: str) -> str:
+    """Return a stable content hash for duplicate detection."""
+    blob = re.sub(r"\s+", " ", (text or "")).strip().lower()
+    return "sha256:" + hashlib.sha256(blob.encode("utf-8")).hexdigest()[:32]
+
+
+def cmd_inspect(args) -> int:
+    """Display URL intelligence for a seed URL without fetching: canonical form,
+    candidate content fingerprint, and the campaign scope rules.
+
+    The agent can run `inspect <url>` BEFORE deciding to dig, so it never blindly
+    crawls: it sees the canonical target and the budget/domain policy up front.
+    """
+    proj = Path(args.dir).expanduser().resolve()
+    research = proj / ".research"
+    if not (research / "state.json").exists():
+        print("No state.json. Run `init` first.", file=sys.stderr)
+        return 1
+    url = args.url
+    canon = canonicalize_url(url)
+    print(f"url                 : {url}")
+    print(f"canonical_url       : {canon}")
+    if canon != url:
+        print(f"  (normalised: {url} -> {canon})")
+    print(f"content_fingerprint : {content_fingerprint(url)} (hash of text to be provided)")
+    scope = research / "scope.json"
+    if scope.exists():
+        print("scope:")
+        for k, v in json.loads(scope.read_text()).items():
+            print(f"  {k:24}: {v}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Objective clarifier / compiler (v0.2.0)
+# ---------------------------------------------------------------------------
+
+_CLARIFY_FINE = {
+    "understand": ["Understand the project/entity's purpose.",
+                   "Understand how it technically works.",
+                   "Map its architecture and key components."],
+    "credibility": ["Evaluate whether its major claims are credible.",
+                    "Trace important claims to primary sources.",
+                    "Identify limitations and criticism."],
+    "origin": ["Identify who created it and its dependencies.",
+               "Trace provenance to the original source."],
+    "safety": ["Assess safety, privacy, and risk considerations."],
+    "reproduce": ["Locate source code / implementation and reproduction steps."],
+    "business": ["Assess commercial viability, funding, and adoption."],
+}
+_CLARIFY_SCOPE = "External links will be followed when relevant, subject to scope.json."
+
+
+def cmd_clarify(args) -> int:
+    """Short, smart objective compiler.
+
+    Turns a URL + a vague goal into a concrete research contract — but only asks
+    focused questions when the objective is materially ambiguous. For clear goals it
+    proposes well-scoped defaults and records assumptions, so it never over-interrupts.
+
+    Modes:
+      clear    -> compile immediately, no questions
+      vague    -> propose sensible defaults, record assumptions, compile
+      ambiguous-> ask the 1-3 essential questions (what/scope/evidence/success)
+    """
+    proj = Path(args.dir).expanduser().resolve()
+    research = proj / ".research"
+    if not (research / "state.json").exists():
+        print("No state.json. Run `init` first.", file=sys.stderr)
+        return 1
+
+    url = args.url
+    mode = (args.mode or "auto").lower()
+    goal = (args.goal or "").strip().lower()
+
+    # Which aspect clusters apply to the stated goal?
+    aspects = []
+    if any(w in goal for w in ("technic", "how it work", "architecture", "how does", "works")):
+        aspects += _CLARIFY_FINE["understand"]
+    if any(w in goal for w in ("credib", "claim", "true", "verify", "reliable", "legit")):
+        aspects += _CLARIFY_FINE["credibility"]
+    if any(w in goal for w in ("who", "create", "author", "creator", "origin", "provenance")):
+        aspects += _CLARIFY_FINE["origin"]
+    if any(w in goal for w in ("safe", "secur", "risk", "privacy")):
+        aspects += _CLARIFY_FINE["safety"]
+    if any(w in goal for w in ("reproduc", "implement", "code", "source", "install")):
+        aspects += _CLARIFY_FINE["reproduce"]
+    if any(w in goal for w in ("viab", "commerc", "business", "fund", "adopt", "money")):
+        aspects += _CLARIFY_FINE["business"]
+
+    if not aspects:
+        # No signal: treat 'learn everything important' as the classic broad set.
+        aspects = (_CLARIFY_FINE["understand"] + _CLARIFY_FINE["credibility"]
+                   + _CLARIFY_FINE["origin"])
+
+    # Scope default.
+    scope = "Internal + external links when relevant (subject to scope.json)."
+
+    print("== Objective Clarifier ==")
+    print(f"seed_url  : {canonicalize_url(url)}")
+
+    if mode == "ambiguous" or (mode == "auto" and goal in ("", "everything", "learn everything", "tell me about")):
+        print("questions (please answer so I can sharpen the objective):")
+        print("  1. What exactly do you want to understand about this?")
+        print("  2. Strictly this site, or follow relevant external links too?")
+        print("  3. What evidence standard do you need (casual | solid | strict)?")
+        print("  4. What would count as a satisfactory answer for you?")
+        return 0
+
+    print("I interpret your goal as:")
+    for a in aspects:
+        print(f"  - {a}")
+    print(f"  - scope: {scope}")
+    print("assumptions recorded:")
+    print(f"  - mode={mode} (clear/vague defaults applied; review & edit in objective.md)")
+
+    if not args.no_write:
+        obj_path = research / "objective.md"
+        lines = [
+            f"# Objective (compiled {_now()})",
+            "",
+            f"## Seed URL",
+            f"{canonicalize_url(url)}",
+            "",
+            f"## Goal (compiled from: '{args.goal}')",
+        ]
+        lines += [f"- {a}" for a in aspects]
+        lines += [
+            "",
+            f"## Scope",
+            f"- {scope}",
+            "",
+            "## Success conditions (define these; the SUCCESS gate checks criteria.jsonl)",
+            "- (_edit_)",
+        ]
+        obj_path.write_text("\n".join(lines) + "\n")
+        print(f"compiled objective -> {obj_path}")
+    return 0
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(prog="research_project.py", description=__doc__)
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -675,6 +1051,37 @@ def main(argv=None) -> int:
     pv.add_argument("--min-corroboration", type=int, default=2,
                     help="minimum independent sources for corroboration-required criteria")
     pv.set_defaults(fn=cmd_verify_success)
+
+    # --- v0.2.0 graph / URL / clarifier commands ---
+    pe = sub.add_parser("edge", help="add an explicit typed edge to the evidence graph")
+    pe.add_argument("dir")
+    pe.add_argument("from_id")
+    pe.add_argument("relationship", choices=sorted(RELATIONSHIPS))
+    pe.add_argument("to_id")
+    pe.add_argument("--context", default=None, help="why this edge matters / surrounding text")
+    pe.set_defaults(fn=cmd_edge)
+
+    pg = sub.add_parser("graph", help="summarise the evidence graph (nodes + edges)")
+    pg.add_argument("dir")
+    pg.add_argument("--recent", default=None,
+                    help="print the N most recent edges")
+    pg.add_argument("--no-validate", action="store_true",
+                    help="skip referential-integrity warnings")
+    pg.set_defaults(fn=cmd_graph)
+
+    pi2 = sub.add_parser("inspect", help="URL intelligence: canonical form + scope rules")
+    pi2.add_argument("dir")
+    pi2.add_argument("url")
+    pi2.set_defaults(fn=cmd_inspect)
+
+    pc2 = sub.add_parser("clarify", help="objective compiler: turn URL+goal into a research contract")
+    pc2.add_argument("dir")
+    pc2.add_argument("url")
+    pc2.add_argument("--goal", default="", help="what you want to understand")
+    pc2.add_argument("--mode", default="auto", choices=["auto", "clear", "vague", "ambiguous"],
+                     help="clear -> compile; vague -> defaults; ambiguous -> ask questions")
+    pc2.add_argument("--no-write", action="store_true", help="do not overwrite objective.md")
+    pc2.set_defaults(fn=cmd_clarify)
 
     args = p.parse_args(argv)
     return args.fn(args)

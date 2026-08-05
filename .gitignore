@@ -19,3 +19,4 @@ dist/
 # ---- misc ----
 *.log
 .DS_Store
+RELEASE-REPORT.md

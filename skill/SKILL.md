@@ -1,7 +1,7 @@
 ---
 name: endless-research
 description: Use when research must dig until it is found.
-version: 1.0.0
+version: 0.2.0
 author: Hermes Agent
 license: MIT
 metadata:
@@ -40,6 +40,10 @@ Companion CLI: `python3 ~/.hermes/skills/research/endless-research/scripts/resea
     state.json                  # machine-readable state (current_state, last_checkpoint, priority queue)
     frontier.jsonl              # pending clues, each with a priority score
     criteria.jsonl              # acceptance criteria the SUCCESS gate verifies
+    edges.jsonl                 # evidence graph: typed relationships between nodes
+    questions.jsonl             # open-question nodes (Q-*)
+    people.jsonl                # person/organisation/entity nodes (P-*)
+    scope.json                  # crawl/scope policy (budgets, not max-depth)
     claims.jsonl                # established claims, each linked to sources
     sources.jsonl               # every source record (url, title, type, accessed)
     contradictions.jsonl        # conflicting evidence
@@ -110,6 +114,15 @@ sources, no critical contradiction is unresolved, and `final-report.md` is subst
 A cheap daily **dormant watcher** independently probes DORMANT campaigns for genuinely
 new evidence (≤3 searches, no full campaign) and re-awakens them via
 `resignal <dir> CONTINUE --cron <research-job-id>`, which auto-resumes the research job.
+
+**Explicit evidence graph (v0.2.0).** Research is a graph, not a linear search. Record
+typed relationships with `edge <dir> <from> <relationship> <to> [--context]` (e.g.
+`SRC-001 cites SRC-002`, `SRC-001 supports CLM-001`, `SRC-002 contradicts CLM-001`,
+`CLUE-001 derived_from SRC-002`). `edge` enforces referential integrity — from/to must
+resolve to real nodes. View with `graph <dir>`. Before digging a new URL, run
+`inspect <dir> <url>` to see its canonical form + the campaign scope (no blind crawling),
+and use `clarify <dir> <url> --goal "..."` to compile a clear/vague/ambiguous goal into
+a research contract.
 
 **Concurrency.** Run every tick through the atomic lock primitive so two ticks can
 never mutate the project simultaneously: `research_project.py tick <dir> [--cmd DIG]`.

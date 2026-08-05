@@ -4,6 +4,93 @@ Deep spec for the durable research campaign. The SKILL.md is the operating playb
 this reference holds the machinery details: cron wiring, delegation rules, priority
 formula, and state machine.
 
+## v0.2.0 — Explicit evidence graph
+
+The research world is a graph (sources, claims, clues, questions, entities, dead-ends,
+contradictions). A flat list tells you *what was found*; a graph tells you *where it
+came from, what it supports, what contradicts it, and how things connect*.
+
+### Nodes
+
+| Prefix | File | Kind |
+|--------|------|------|
+| `SRC-*` | `sources.jsonl` | Source (URL, title, type, accessed) |
+| `CLM-*` | `claims.jsonl` | Claim (status, confidence, sources) |
+| `CLUE-*` | `frontier.jsonl` | Clue / frontier item |
+| `Q-*` | `questions.jsonl` | Open question |
+| `P-*` | `people.jsonl` | Person / organisation / entity |
+| `DE-*` | `dead-ends.jsonl` | Dead end (with reopen conditions) |
+| `X-*` | `contradictions.jsonl` | Contradiction |
+
+### Edges — `edges.jsonl`
+
+An edge is an explicit typed relationship between two nodes. Recorded with `edge`:
+
+```json
+{
+  "edge_id": "EDGE-<uuid>",
+  "from_id": "SRC-0012",
+  "relationship": "cites",
+  "to_id": "SRC-0047",
+  "context": "Listed as the original technical report",
+  "discovered_at": "2026-08-05T12:00:00Z"
+}
+```
+
+**Allowed relationships:** `links_to`, `cites`, `authored_by`, `published_by`,
+`supports`, `contradicts`, `answers`, `depends_on`, `derived_from`, `investigates`,
+`duplicate_of`, `archived_version_of`, `blocks`.
+
+**Machine-enforced referential integrity:** `edge` rejects any `from_id`/`to_id` that
+does not resolve to a real node in the project files (unless it is a fresh `Q-`/`P-`
+id), and enforces domain rules (e.g. `supports`/`contradicts` require a `CLM` as
+`to_id`; `answers` requires a `CLM` as `from_id`).
+
+**View the graph:** `graph <dir>` prints nodes-by-kind and edges-by-relationship, and
+optionally warns about dangling references. This is the machine-checkable view of the
+evidence graph.
+
+### URL intelligence (no blind crawling)
+
+- **`inspect <dir> <url>`** — shows the canonical URL, a content fingerprint, and the
+  campaign scope rules, *before any fetching*. Run this before deciding to dig.
+- **URL canonicalisation** (`canonicalize_url`): strips fragments, drops tracking params
+  (`utm_*`, `fbclid`, `gclid`, `ref`, ...), normalises `www.`, drops empty params,
+  sorts remaining params. Tracking variants collapse to one identity.
+- **Content fingerprinting** (`content_fingerprint`): a `sha256:` hash of whitespace-
+  normalised text for duplicate detection (`duplicate_of` / `archived_version_of` edges).
+
+### Scope rules — `scope.json`
+
+Budget-based control, NOT a strict max-depth (a primary source may be six links away).
+Per campaign: `follow_internal_links`, `follow_external_links`, `allowed_domains`,
+`blocked_domains`, `max_pages_per_domain`, `relevance_budget`, `page_budget`,
+`allow_archives`, `allow_repositories`, `allow_documents`.
+
+The engine is a **targeted researcher, not a crawler**: it understands why each link
+matters, scores links against the objective, and follows only high-value branches. It
+records both "discovered" and "investigated" links — a link can be discovered without
+being worth investigating. It avoids calendric-infinite, pagination, filter, tag,
+login-redirect, tracking, duplicate/mobile, legal/privacy, auto-generated, and circular
+pages. Use diminishing-information-gain + relevance budget + page budget rather than
+`max_depth`.
+
+### Objective clarifier — `clarify <dir> <url> [--goal TXT]`
+
+A short, intelligent **objective compiler** that turns URL + vague intent into a
+measurable research contract — without over-interrupting:
+
+| Input | Behaviour |
+|-------|-----------|
+| **Clear** goal (e.g. "how it works + credible") | Compile the research contract now, no questions |
+| **Vague** goal (e.g. "learn everything important") | Infer sensible defaults (purpose, architecture, creators, verify claims, limitations, trace to primary), record assumptions, start |
+| **Materially ambiguous** goal (empty / "tell me about") | Ask only the essential questions (what to understand / strict-vs-external links / evidence standard / what counts as success) |
+
+`--mode auto|clear|vague|ambiguous` forces behaviour. `--no-write` avoids overwriting
+`objective.md`. The clarifier canonicalises the seed URL and writes the compiled
+contract (Seed URL + Goal aspects + Scope + Success-conditions placeholder) to
+`objective.md`.
+
 ## State machine
 
 ```
