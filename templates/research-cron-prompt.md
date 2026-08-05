@@ -25,30 +25,33 @@ CONCURRENCY — DESIGN 2 (lock every shared-state write):
   per mutation. NEVER edit a .research/*.jsonl (or state.json) file with a text editor
   or raw write — always go through the CLI so the flock guards the shared state.
 
-  Locked write primitives (each acquires <proj>/.research/.lock — NEVER hand-edit
-  any file under .research/):
-    python3 RPT source        add <PROJECT> --url <URL> [--title T] [--author A] [--publisher P] [--type T] [--note N]
-    python3 RPT claim         add <PROJECT> --claim "<text>" [--sources SRC-1,SRC-2] [--technique T]
-    python3 RPT frontier      add <PROJECT> --description "<clue>" [--parent SRC-1]
-    python3 RPT frontier      update <PROJECT> <CLUE-ID> [--status done_proven|dead|pending] [--attempt]
-    python3 RPT edge          <PROJECT> <from> <relationship> <to> [--context "..."]
-    python3 RPT search-log    add <PROJECT> --query "<q>" [--strategy S] [--outcome O]
-    python3 RPT dead-end      add <PROJECT> --description "<branch>" [--why-failed F] [--may-reopen] [--reopen-conditions C]
-    python3 RPT criterion     add <PROJECT> --description "<crit>" [--evidence-required E] [--primary-hard] [--corroboration]
-    python3 RPT criterion     update <PROJECT> <CID> --met 1 --evidence SRC-1,SRC-2 [--exception "note"]
-    python3 RPT contradiction add <PROJECT> --description "<A vs B>" [--critical] [--side-a A] [--side-b B]
-    python3 RPT contradiction resolve <PROJECT> <XID> --note "how resolved"
-    python3 RPT report        write <PROJECT> --content "# Final Report\n..."
-    python3 RPT resignal      <PROJECT> <STATE> [--note "..."] [--cron <RESEARCH_JOB_ID>]
-    python3 RPT checkpoint    <PROJECT> [--note "..."]
-  (If a locked command exits code 2, the project is locked by a prior run: for
-   mutations, skip that write; if the whole project is contested, report "skipped: locked")
-
   WORKER LEASE: your cron run's pre-run gate acquired a lease and printed your run id
-  as {"run_id": <RUN_ID>}. It is OWNED BY YOU — only your exact run id can release it.
-  Call HEARTBEAT periodically (and after each substantial phase) so a long session does
-  not lose ownership when the TTL expires:
+  as {"run_id": <RUN_ID>}. It is OWNED BY YOU — only your exact run id can release it
+  or write to the campaign. Pass `--run-id <RUN_ID>` on EVERY locked mutation below
+  (and `--operator-override` is NOT for you). Call HEARTBEAT periodically (and after
+  each substantial phase) so a long session does not lose ownership when the TTL expires:
     python3 ~/.hermes/scripts/campaign-lease-gate.py HEARTBEAT <PROJECT> --run-id <RUN_ID>
+
+  Locked write primitives (each acquires <proj>/.research/.lock — NEVER hand-edit
+  any file under .research/; each takes `--run-id <RUN_ID>` to prove ownership —
+  if a mutation is REFUSED because you lack the run-id, you are likely a duplicate/
+  stale worker; STOP cleanly):
+    python3 RPT source        add <PROJECT> --url <URL> [--title T] [--author A] [--publisher P] [--type T] [--note N] --run-id <RUN_ID>
+    python3 RPT claim         add <PROJECT> --claim "<text>" [--sources SRC-1,SRC-2] [--technique T] --run-id <RUN_ID>
+    python3 RPT frontier      add <PROJECT> --description "<clue>" [--parent SRC-1] --run-id <RUN_ID>
+    python3 RPT frontier      update <PROJECT> <CLUE-ID> [--status done_proven|dead|pending] [--attempt] --run-id <RUN_ID>
+    python3 RPT edge          <PROJECT> <from> <relationship> <to> [--context "..."] --run-id <RUN_ID>
+    python3 RPT search-log    add <PROJECT> --query "<q>" [--strategy S] [--outcome O] --run-id <RUN_ID>
+    python3 RPT dead-end      add <PROJECT> --description "<branch>" [--why-failed F] [--may-reopen] [--reopen-conditions C] --run-id <RUN_ID>
+    python3 RPT criterion     add <PROJECT> --description "<crit>" [--primary-hard] [--corroboration] --run-id <RUN_ID>
+    python3 RPT criterion     update <PROJECT> <CID> --met 1 --evidence SRC-1,SRC-2 --run-id <RUN_ID>
+    python3 RPT contradiction add <PROJECT> --description "<A vs B>" [--critical] [--side-a A] [--side-b B] --run-id <RUN_ID>
+    python3 RPT contradiction resolve <PROJECT> <XID> --note "how resolved" --run-id <RUN_ID>
+    python3 RPT report        write <PROJECT> --content "# Final Report\n..." --run-id <RUN_ID>
+    python3 RPT resignal      <PROJECT> <STATE> [--note "..."] [--cron <RESEARCH_JOB_ID>] --run-id <RUN_ID>
+    python3 RPT checkpoint    <PROJECT> [--note "..."] --run-id <RUN_ID>
+  If a locked command exits code 2, the project is locked by a prior run: skip that
+  write. If it exits code 3, you do not own the lease: you are a duplicate — STOP.
 
 STEP 1 — Read .research/state.json and .research/frontier.jsonl FIRST. Stop if
 current_state is SUCCESS/EXHAUSTED/DORMANT (report the verdict; SUCCESS/EXHAUSTED:

@@ -102,28 +102,33 @@ combine both into one job). Each cron fire starts a **fresh** Hermes session tha
 the campaign from disk, runs one bounded burst, and checkpoints — the campaign, not the
 session, is persistent.
 
-Attach the **worker-lease gate** to the research job (so only one worker runs per
-campaign; it also skips the agent entirely when dormant/finished):
+**Attach a per-campaign lease-gate wrapper to the research job.** Hermes runs a cron
+pre-run `script=` from the SCRIPT'S OWN directory (not the job `workdir`), so a gate that
+leans on `cwd` will not find the campaign and will wrongly emit `{"wakeAgent": false}`.
+Generate a wrapper with the absolute project path baked in:
 
 ```bash
-# install the pre-run gate (once)
+# 1. install the gate (once) and generate a per-campaign wrapper
 cp scripts/campaign-lease-gate.py ~/.hermes/scripts/campaign-lease-gate.py
+endless-research cron-wrapper ~/research/my-campaign --name my-campaign
+#    -> writes ~/.hermes/scripts/my-campaign-lease-gate.sh
 
-# Job 1 (research) — research-only prompt + lease-gate pre-run script
+# 2. Job 1 (research) — research-only prompt + the per-campaign wrapper as script=
 hermes cron add --every 2h --name "my-campaign research" \
   --workdir "$HOME/research/my-campaign" \
-  --script "campaign-lease-gate.py" \
+  --script "my-campaign-lease-gate.sh" \
   --skills endless-research --prompt "$(cat templates/research-cron-prompt.md)"
 
-# Job 2 (dormant watcher) — watcher-only prompt
+# 3. Job 2 (dormant watcher) — watcher-only prompt
 hermes cron add --every 12h --name "my-campaign dormant-watcher" \
   --workdir "$HOME/research/my-campaign" \
   --skills endless-research --prompt "$(cat templates/dormant-watcher-prompt.md)"
 ```
 
-The lease gate emits `{"wakeAgent": false}` (no model tokens) when another live worker
-holds the lease or the campaign is DORMANT/SUCCESS/EXHAUSTED. The research agent RELEASEs
-its lease at the end of each tick.
+The gate emits `{"wakeAgent": false}` (no model tokens) when another live worker holds
+the lease or the campaign is DORMANT/SUCCESS/EXHAUSTED. The research agent passes its
+`--run-id` on every locked write (ownership), HEARTBEATs periodically, and RELEASEs the
+lease at the end of each tick.
 
 See the **full example project** in `examples/demo-project/`.
 

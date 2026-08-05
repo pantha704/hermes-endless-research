@@ -279,23 +279,25 @@ def cmd_init(args) -> int:
     success = args.success or "_unset_"
     failure = args.failure or "_unset_"
 
-    for name, content in TEMPLATES.items():
-        target = research / name
-        if target.exists():
-            continue
-        filled = (
-            content.format(objective=objective, success=success, failure=failure,
-                           now=_now())
-            if name in ("objective.md", "state.json")
-            else content
-        )
-        target.write_text(filled)
+    with _project_lock(proj, timeout=max(1.0, float(getattr(args, "lock_timeout", 10)))):
+        for name, content in TEMPLATES.items():
+            target = research / name
+            if target.exists():
+                continue
+            filled = (
+                content.format(objective=objective, success=success, failure=failure,
+                               now=_now())
+                if name in ("objective.md", "state.json")
+                else content
+            )
+            target.write_text(filled)
 
     script = Path(os.path.abspath(__file__))
     hermes_md = HERMES_MD.format(name=proj.name, script=script)
     hfile = proj / "HERMES.md"
     if not hfile.exists():
-        hfile.write_text(hermes_md)
+        with _project_lock(proj, timeout=max(1.0, float(getattr(args, "lock_timeout", 10)))):
+            hfile.write_text(hermes_md)
 
     print(f"Scaffolded research project at {proj}")
     print("  Edit .research/objective.md, then enqueue initial clues in frontier.jsonl")
@@ -395,6 +397,9 @@ def cmd_resignal(args) -> int:
         print()
 
     # Read-modify-write state.json while holding the project lock (Design 2).
+    guard = _lease_guard(args)
+    if guard:
+        return guard
     try:
         with _project_lock(proj, timeout=max(1.0, float(getattr(args, "lock_timeout", 10)))):
             state = json.loads(state_f.read_text())
@@ -466,6 +471,9 @@ def cmd_checkpoint(args) -> int:
     ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S_%f")  # microsecond suffix avoids same-second collisions
     cp = research / "checkpoints" / f"cp_{ts}.md"
     # Read-modify-write state.json + checkpoint file under the project lock (Design 2).
+    guard = _lease_guard(args)
+    if guard:
+        return guard
     try:
         with _project_lock(proj, timeout=max(1.0, float(getattr(args, "lock_timeout", 10)))):
             state = json.loads(state_f.read_text())
@@ -778,6 +786,9 @@ def cmd_edge(args) -> int:
 
     # Edge may point at a Q-* / P-* node that does not exist yet; mint it later.
     # Work entirely under the lock so node+edge creation is atomic.
+    guard = _lease_guard(args)
+    if guard:
+        return guard
     try:
         with _project_lock(proj, timeout=max(1.0, float(getattr(args, "lock_timeout", 10)))):
             results = []
@@ -848,13 +859,61 @@ def cmd_edge(args) -> int:
 # serialized by the project lock. This is the crash-resistant design: a state-changing
 # operation is a single locked CLI call.
 
+def _check_lease_owner(args, proj: Path, research: Path) -> bool:
+    """Enforce optional token ownership on a mutation.
+
+    When a LIVE worker lease exists in `.research/.worker-lease.json`:
+      - if --run-id matches the lease -> permit
+      - if --run-id is missing/wrong -> REFUSE, UNLESS --operator-override
+    When no live lease exists -> a manual/administrative mutation is permitted.
+
+    Returns True to allow the mutation, False to refuse. The caller prints the reason.
+    """
+    try:
+        lease = json.loads((research / ".worker-lease.json").read_text())
+    except Exception:
+        return True  # no readable lease -> manual operation permitted
+
+    # Live lease? (running + not expired)
+    lease_live = lease.get("status") == "running" and time.time() < lease.get("expires_at", 0)
+    if not lease_live:
+        return True
+
+    given = getattr(args, "run_id", None)
+    if given and given == lease.get("run_id"):
+        return True
+    if getattr(args, "operator_override", False):
+        return True
+    print(f"REFUSED: campaign has a live worker lease (run_id={lease.get('run_id')}). "
+          f"Pass --run-id <that token> to prove you own this run, or --operator-override to "
+          f"force a manual write.", file=sys.stderr)
+    return False
+
+
+def _lease_guard(args) -> int:
+    """Run BEFORE a mutation: return 0 to proceed, 3 to refuse on lease ownership.
+
+    Enforces the global one-worker contract: IF a live lease exists, the mutation
+    must present the lease's run_id (or an --operator-override). A mutation with no
+    run_id while a live lease is held is REFUSED, closing the "ungated manual worker"
+    gap. With no live lease, manual/administrative mutations are permitted.
+    """
+    proj = Path(args.dir).expanduser().resolve()
+    if not _check_lease_owner(args, proj, proj / ".research"):
+        return 3
+    return 0
+
+
 def _locked_append(args, fname: str, node: dict, label: str) -> int:
-    """Append `node` to `.research/<fname>` under the project lock."""
+    """Append `node` to `.research/<fname>` under the project lock (+ optional lease guard)."""
     proj = Path(args.dir).expanduser().resolve()
     research = proj / ".research"
     if not (research / "state.json").exists():
         print("No state.json. Run `init` first.", file=sys.stderr)
         return 1
+    guard = _lease_guard(args)
+    if guard:
+        return guard
     try:
         with _project_lock(proj, timeout=max(1.0, float(getattr(args, "lock_timeout", 10)))):
             with open(research / fname, "a", encoding="utf-8") as fh:
@@ -1014,6 +1073,9 @@ def cmd_criterion_update(args) -> int:
     if not fname.exists():
         print("No criteria.jsonl. Run `init` first.", file=sys.stderr)
         return 1
+    guard = _lease_guard(args)
+    if guard:
+        return guard
     try:
         with _project_lock(proj, timeout=max(1.0, float(getattr(args, "lock_timeout", 10)))):
             rows = _load_jsonl(fname)
@@ -1053,6 +1115,9 @@ def cmd_contradiction_resolve(args) -> int:
     if not fname.exists():
         print("No contradictions.jsonl.", file=sys.stderr)
         return 1
+    guard = _lease_guard(args)
+    if guard:
+        return guard
     try:
         with _project_lock(proj, timeout=max(1.0, float(getattr(args, "lock_timeout", 10)))):
             rows = _load_jsonl(fname)
@@ -1078,6 +1143,9 @@ def cmd_report_write(args) -> int:
         print("No state.json. Run `init` first.", file=sys.stderr)
         return 1
     body = args.content if getattr(args, "content", None) else ""
+    guard = _lease_guard(args)
+    if guard:
+        return guard
     try:
         with _project_lock(proj, timeout=max(1.0, float(getattr(args, "lock_timeout", 10)))):
             (research / "final-report.md").write_text(body)
@@ -1086,6 +1154,64 @@ def cmd_report_write(args) -> int:
         return 2
     print(f"Wrote final-report.md ({len(body)} chars)")
     return 0
+
+
+def cmd_cron_wrapper(args) -> int:
+    """Generate a per-campaign cron pre-run lease-gate wrapper.
+
+    WHY: Hermes runs a cron `script=` pre-run in the SCRIPT'S OWN directory
+    (`{HERMES_HOME}/scripts/`), NOT the job's workdir (scheduler.py:2313:
+    `_script_cwd = workdir or str(path.parent)`; the wake-gate caller passes no
+    workdir). So a gate that relies on `cwd` to find the campaign will see
+    `~/.hermes/scripts/` and wrongly emit `{"wakeAgent": false}` — the agent never
+    starts. This wrapper bakes in the ABSOLUTE project path, so it works regardless
+    of Hermes' cwd behaviour.
+    """
+    import os
+    proj = Path(args.dir).expanduser().resolve()
+    if not (proj / ".research" / "state.json").exists():
+        print("No state.json. Run `init` first.", file=sys.stderr)
+        return 1
+
+    scripts_dir = Path(os.path.expanduser("~/.hermes/scripts"))
+    scripts_dir.mkdir(parents=True, exist_ok=True)
+    name = (args.name or proj.name or "campaign").strip()
+    safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in name)
+    wrapper = scripts_dir / f"{safe}-lease-gate.sh"
+
+    gate_candidates = [
+        Path(os.path.expanduser("~/.hermes/scripts/campaign-lease-gate.py")),
+        Path(__file__).resolve().parent.parent / "scripts" / "campaign-lease-gate.py",
+    ]
+    gate = next((p for p in gate_candidates if p.exists()), None)
+    if gate is None:
+        print("campaign-lease-gate.py not found; install it first.", file=sys.stderr)
+        return 1
+
+    if args.run_id:
+        exec_line = 'exec python3 "$GATE" CHECK "$PROJECT" --run-id "$RUN_ID"'
+    else:
+        exec_line = 'exec python3 "$GATE" CHECK "$PROJECT"'
+    content = (
+        f"#!/usr/bin/env bash\n"
+        f"# Per-campaign lease gate for: {proj}\n"
+        f"# Generated by `endless-research cron-wrapper`. Attach to a research cron job\n"
+        f"# as:  --script \"{wrapper.name}\"\n"
+        f"# so the gate finds the campaign regardless of Hermes' cwd behaviour.\n"
+        f"GATE={gate}\n"
+        f"PROJECT={proj}\n"
+        f'RUN_ID="${{RUN_ID:-}}"\n'
+        f"{exec_line}\n"
+    )
+    wrapper.write_text(content)
+    try:
+        os.chmod(wrapper, 0o755)
+    except OSError:
+        pass
+    print(f"Wrote cron pre-run wrapper: {wrapper}")
+    print(f"Attach to the research job as:  --script \"{wrapper.name}\"")
+    return 0
+
 
 
 def cmd_graph(args) -> int:
@@ -1129,12 +1255,26 @@ def cmd_graph(args) -> int:
         for e in edges[-int(args.recent):]:
             print(f"    {e.get('edge_id')}: {e.get('from_id')} -[{e.get('relationship')}]-> {e.get('to_id')}")
     if not args.no_validate:
-        bad = [e for e in edges
-               if e.get("from_id") and e.get("to_id")
-               and not _node_exists(research, e["from_id"])
-               and not e["from_id"].startswith(("Q.", "P."))]
+        def _node_present(nid):
+            if not (nid and str(nid).strip()):
+                return True  # blank endpoint — skip (not meaningful)
+            return _node_exists(research, str(nid))
+        # Audit BOTH endpoints to catch damaged / imported / legacy graph data.
+        bad_from = [e for e in edges if not _node_present(e.get("from_id"))]
+        bad_to = [e for e in edges if not _node_present(e.get("to_id"))]
+        seen, bad = set(), []
+        for e in bad_from + bad_to:          # dedupe by edge_id, keep order
+            if e.get("edge_id") in seen:
+                continue
+            seen.add(e.get("edge_id")); bad.append(e)
         if bad:
-            print(f"  WARN: {len(bad)} edge(s) reference a node not yet present in the graph files.")
+            print(f"  WARN: {len(bad)} edge(s) reference a node (from_id or to_id) "
+                  f"that is not present in the graph files.")
+            for e in bad[:10]:
+                print(f"    {e.get('edge_id')}: {e.get('from_id')} "
+                      f"-[{e.get('relationship')}]-> {e.get('to_id')}")
+        else:
+            print("  validation: all edge endpoints resolve to existing nodes.")
     return 0
 
 
@@ -1349,7 +1489,8 @@ def cmd_clarify(args) -> int:
             "## Success conditions (define these; the SUCCESS gate checks criteria.jsonl)",
             "- (_edit_)",
         ]
-        obj_path.write_text("\n".join(lines) + "\n")
+        with _project_lock(proj, timeout=max(1.0, float(getattr(args, "lock_timeout", 10)))):
+            obj_path.write_text("\n".join(lines) + "\n")
         print(f"compiled objective -> {obj_path}")
     return 0
 
@@ -1395,6 +1536,8 @@ def main(argv=None) -> int:
     pc.add_argument("dir")
     pc.add_argument("--note", default=None)
     pc.add_argument("--lock-timeout", dest="lock_timeout", type=float, default=10)
+    pc.add_argument("--run-id", default=None, help="prove ownership of the active worker lease")
+    pc.add_argument("--operator-override", action="store_true", help="force a manual write despite a live lease (emergency)")
     pc.set_defaults(fn=cmd_checkpoint)
 
     pt = sub.add_parser("tick", help="run ONE research tick under the atomic project lock")
@@ -1442,7 +1585,16 @@ def main(argv=None) -> int:
     pc2.add_argument("--mode", default="auto", choices=["auto", "clear", "vague", "ambiguous"],
                      help="clear -> compile; vague -> defaults; ambiguous -> ask questions")
     pc2.add_argument("--no-write", action="store_true", help="do not overwrite objective.md")
+    pc2.add_argument("--lock-timeout", dest="lock_timeout", type=float, default=10)
     pc2.set_defaults(fn=cmd_clarify)
+
+    pwrap = sub.add_parser("cron-wrapper",
+                           help="generate a per-campaign lease-gate wrapper for a cron `script=` field")
+    pwrap.add_argument("dir")
+    pwrap.add_argument("--name", default=None, help="short name -> <name>-lease-gate.sh")
+    pwrap.add_argument("--run-id", default=None,
+                       help="bake a token so the gate enforces token ownership")
+    pwrap.set_defaults(fn=cmd_cron_wrapper)
 
     # --- v0.2.2 locked mutation primitives (Design 2) ---
     # source / claim / frontier writes all acquire the project lock, so every
@@ -1460,6 +1612,8 @@ def main(argv=None) -> int:
     psrc_a.add_argument("--accessed", default=None)
     psrc_a.add_argument("--note", default=None)
     psrc_a.add_argument("--lock-timeout", dest="lock_timeout", type=float, default=10)
+    psrc_a.add_argument("--run-id", default=None, help="prove ownership of the active worker lease")
+    psrc_a.add_argument("--operator-override", action="store_true", help="force a manual write despite a live lease (emergency)")
     psrc_a.set_defaults(fn=cmd_source_add)
 
     pcl = sub.add_parser("claim", help="add a claim node (CLM-*) — LOCKED write")
@@ -1474,6 +1628,8 @@ def main(argv=None) -> int:
     pcl_a.add_argument("--id", default=None)
     pcl_a.add_argument("--note", default=None)
     pcl_a.add_argument("--lock-timeout", dest="lock_timeout", type=float, default=10)
+    pcl_a.add_argument("--run-id", default=None, help="prove ownership of the active worker lease")
+    pcl_a.add_argument("--operator-override", action="store_true", help="force a manual write despite a live lease (emergency)")
     pcl_a.set_defaults(fn=cmd_claim_add)
 
     pfr = sub.add_parser("frontier", help="add/update frontier clues — LOCKED writes")
@@ -1491,6 +1647,8 @@ def main(argv=None) -> int:
     pfr_a.add_argument("--novelty", default=5)
     pfr_a.add_argument("--ease", default=5)
     pfr_a.add_argument("--lock-timeout", dest="lock_timeout", type=float, default=10)
+    pfr_a.add_argument("--run-id", default=None, help="prove ownership of the active worker lease")
+    pfr_a.add_argument("--operator-override", action="store_true", help="force a manual write despite a live lease (emergency)")
     pfr_a.set_defaults(fn=cmd_frontier_add)
     pfr_u = pfr_sub.add_parser("update", help="update a clue status/attempts")
     pfr_u.add_argument("dir")
@@ -1498,6 +1656,8 @@ def main(argv=None) -> int:
     pfr_u.add_argument("--status", default=None)
     pfr_u.add_argument("--attempt", action="store_true")
     pfr_u.add_argument("--lock-timeout", dest="lock_timeout", type=float, default=10)
+    pfr_u.add_argument("--run-id", default=None, help="prove ownership of the active worker lease")
+    pfr_u.add_argument("--operator-override", action="store_true", help="force a manual write despite a live lease (emergency)")
     pfr_u.set_defaults(fn=cmd_frontier_update)
 
     # --- v0.2.4: lock the remaining mutations (search-log / dead-end / criterion / contradiction / report) ---
@@ -1510,6 +1670,8 @@ def main(argv=None) -> int:
     pslog_a.add_argument("--results", type=int, default=0)
     pslog_a.add_argument("--outcome", default=None)
     pslog_a.add_argument("--lock-timeout", dest="lock_timeout", type=float, default=10)
+    pslog_a.add_argument("--run-id", default=None, help="prove ownership of the active worker lease")
+    pslog_a.add_argument("--operator-override", action="store_true", help="force a manual write despite a live lease (emergency)")
     pslog_a.set_defaults(fn=cmd_searchlog_add)
 
     pde = sub.add_parser("dead-end", help="add a dead-end branch — LOCKED write")
@@ -1526,6 +1688,8 @@ def main(argv=None) -> int:
     pde_a.add_argument("--may-reopen", action="store_true")
     pde_a.add_argument("--reopen-conditions", default=None)
     pde_a.add_argument("--lock-timeout", dest="lock_timeout", type=float, default=10)
+    pde_a.add_argument("--run-id", default=None, help="prove ownership of the active worker lease")
+    pde_a.add_argument("--operator-override", action="store_true", help="force a manual write despite a live lease (emergency)")
     pde_a.set_defaults(fn=cmd_deadend_add)
 
     pcrit = sub.add_parser("criterion", help="add/update acceptance criteria — LOCKED writes")
@@ -1538,6 +1702,8 @@ def main(argv=None) -> int:
     pcrit_a.add_argument("--primary-hard", action="store_true")
     pcrit_a.add_argument("--id", default=None)
     pcrit_a.add_argument("--lock-timeout", dest="lock_timeout", type=float, default=10)
+    pcrit_a.add_argument("--run-id", default=None, help="prove ownership of the active worker lease")
+    pcrit_a.add_argument("--operator-override", action="store_true", help="force a manual write despite a live lease (emergency)")
     pcrit_a.set_defaults(fn=cmd_criterion_add)
     pcrit_u = pcrit_sub.add_parser("update", help="update a criterion")
     pcrit_u.add_argument("dir")
@@ -1546,6 +1712,8 @@ def main(argv=None) -> int:
     pcrit_u.add_argument("--evidence", default=None, help="comma-separated source ids")
     pcrit_u.add_argument("--exception", default=None)
     pcrit_u.add_argument("--lock-timeout", dest="lock_timeout", type=float, default=10)
+    pcrit_u.add_argument("--run-id", default=None, help="prove ownership of the active worker lease")
+    pcrit_u.add_argument("--operator-override", action="store_true", help="force a manual write despite a live lease (emergency)")
     pcrit_u.set_defaults(fn=cmd_criterion_update)
 
     pcon = sub.add_parser("contradiction", help="add/resolve contradictions — LOCKED writes")
@@ -1559,12 +1727,16 @@ def main(argv=None) -> int:
     pcon_a.add_argument("--notes", default=None)
     pcon_a.add_argument("--id", default=None)
     pcon_a.add_argument("--lock-timeout", dest="lock_timeout", type=float, default=10)
+    pcon_a.add_argument("--run-id", default=None, help="prove ownership of the active worker lease")
+    pcon_a.add_argument("--operator-override", action="store_true", help="force a manual write despite a live lease (emergency)")
     pcon_a.set_defaults(fn=cmd_contradiction_add)
     pcon_r = pcon_sub.add_parser("resolve", help="mark a contradiction resolved")
     pcon_r.add_argument("dir")
     pcon_r.add_argument("contradiction")
     pcon_r.add_argument("--note", default=None)
     pcon_r.add_argument("--lock-timeout", dest="lock_timeout", type=float, default=10)
+    pcon_r.add_argument("--run-id", default=None, help="prove ownership of the active worker lease")
+    pcon_r.add_argument("--operator-override", action="store_true", help="force a manual write despite a live lease (emergency)")
     pcon_r.set_defaults(fn=cmd_contradiction_resolve)
 
     prep = sub.add_parser("report", help="write final-report.md — LOCKED write")
@@ -1573,6 +1745,8 @@ def main(argv=None) -> int:
     prep_w.add_argument("dir")
     prep_w.add_argument("--content", required=True)
     prep_w.add_argument("--lock-timeout", dest="lock_timeout", type=float, default=10)
+    prep_w.add_argument("--run-id", default=None, help="prove ownership of the active worker lease")
+    prep_w.add_argument("--operator-override", action="store_true", help="force a manual write despite a live lease (emergency)")
     prep_w.set_defaults(fn=cmd_report_write)
 
     args = p.parse_args(argv)

@@ -6,6 +6,32 @@ adheres to [Semantic Versioning](https://semver.org/) (with `v0.x` pre-1.0 seman
 
 ## [Unreleased]
 
+## [0.2.5] — 2026-08-05
+### Fixed (real Hermes cron integration + global worker contract)
+- **Per-campaign cron gate (fixes the documented command not working).** Verified in
+  `cron/scheduler.py` that a cron `script=` pre-run runs in the SCRIPT'S OWN directory
+  (`_script_cwd = workdir or str(path.parent)`, and the wake-gate calls it with no
+  workdir), so a gate that relies on `cwd` sees `~/.hermes/scripts/` and wrongly emits
+  `{"wakeAgent": false}` — the research agent never starts. New
+  `endless-research cron-wrapper <project> [--name N]` generates a per-campaign wrapper
+  with the ABSOLUTE project path, to be attached as `--script "<name>-lease-gate.sh"`.
+  README + research cron prompt updated to use it.
+- **Global one-worker contract on mutations.** Runtime mutations (`source`, `claim`,
+  `frontier`, `edge`, `search-log`, `dead-end`, `criterion`, `contradiction`, `report`,
+  `resignal`, `checkpoint`, `tick`) now enforce token ownership: when a LIVE lease exists,
+  the mutation must present `--run-id <token>` (matches the lease) or `--operator-override`
+  (deliberate emergency bypass); a missing/wrong run_id is REFUSED (exit 3). With no live
+  lease, manual/administrative writes are permitted. This closes the "ungated manual /
+  independent worker" gap — the lease is now a system-wide ownership contract, not just a
+  scheduling convention.
+- **Locked the remaining writers.** `clarify` and `init` now hold the project lock while
+  writing `objective.md` / scaffold files.
+- **Graph validates BOTH endpoints.** `graph` now audits dangling `to_id` as well as
+  `from_id` (catches damaged/imported/legacy graph data).
+- **Tests:** new `test_v25.py` (9 tests: cron-wrapper path/cwd independence, mutation
+  ownership refusal/allowed/override, graph to_id + clean audit). Suite: 75 → **84 tests**,
+  all green (incl. Python 3.9 parse check).
+
 ## [0.2.4] — 2026-08-05
 ### Fixed (correct one-worker-per-campaign lease + complete mutation locking)
 The audit found the v0.2.3 lease was PID-based (gate PID dies before the agent runs),
