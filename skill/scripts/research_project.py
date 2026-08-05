@@ -967,6 +967,127 @@ def cmd_frontier_update(args) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# v0.2.4: lock EVERY shared-state mutation (search-log / dead-ends / criteria /
+#         contradiction / final-report). No raw .research writes.
+# ---------------------------------------------------------------------------
+
+def cmd_searchlog_add(args) -> int:
+    """Append a search-log entry (query + outcome) UNDER THE PROJECT LOCK."""
+    node = {"ts": _now(), "query": args.query, "strategy": args.strategy or "",
+            "results": args.results or 0, "outcome": args.outcome or ""}
+    return _locked_append(args, "search-log.jsonl", node, "search-log")
+
+
+def cmd_deadend_add(args) -> int:
+    """Append a dead-end branch UNDER THE PROJECT LOCK."""
+    research = Path(args.dir).expanduser().resolve() / ".research"
+    did = args.id or _mint_id(research, "dead-ends.jsonl", "DE")
+    node = {"clue_id": did, "from_source": args.parent,
+            "description": args.description,
+            "attempted": args.attempted or "",
+            "queries": args.queries or "",
+            "sources": args.sources or "",
+            "why_failed": args.why_failed or "",
+            "may_reopen": bool(args.may_reopen),
+            "reopen_conditions": args.reopen_conditions or ""}
+    return _locked_append(args, "dead-ends.jsonl", node, "dead-end")
+
+
+def cmd_criterion_add(args) -> int:
+    """Append an acceptance criterion UNDER THE PROJECT LOCK."""
+    research = Path(args.dir).expanduser().resolve() / ".research"
+    cid = args.id or _mint_id(research, "criteria.jsonl", "C")
+    node = {"id": cid, "description": args.description,
+            "evidence_required": args.evidence_required or "primary_or_exception",
+            "corroboration_required": bool(args.corroboration),
+            "primary_hard": bool(args.primary_hard),
+            "met": False, "evidence_source_ids": [], "exception": None}
+    return _locked_append(args, "criteria.jsonl", node, "criterion")
+
+
+def cmd_criterion_update(args) -> int:
+    """Update a criterion (met / evidence / exception) UNDER THE PROJECT LOCK."""
+    proj = Path(args.dir).expanduser().resolve()
+    research = proj / ".research"
+    fname = research / "criteria.jsonl"
+    if not fname.exists():
+        print("No criteria.jsonl. Run `init` first.", file=sys.stderr)
+        return 1
+    try:
+        with _project_lock(proj, timeout=max(1.0, float(getattr(args, "lock_timeout", 10)))):
+            rows = _load_jsonl(fname)
+            target = next((r for r in rows if r.get("id") == args.criterion), None)
+            if target is None:
+                print(f"criterion {args.criterion} not found", file=sys.stderr)
+                return 1
+            if args.met is not None:
+                target["met"] = args.met in ("1", "true", "True", "yes")
+            if args.evidence:
+                target["evidence_source_ids"] = [s.strip() for s in args.evidence.split(",") if s.strip()]
+            if args.exception is not None:
+                target["exception"] = args.exception or None
+            fname.write_text("".join(json.dumps(r) + "\n" for r in rows))
+    except BlockingIOError:
+        print("Project locked by another researcher — criterion not updated.", file=sys.stderr)
+        return 2
+    print(f"Updated criterion {args.criterion}")
+    return 0
+
+
+def cmd_contradiction_add(args) -> int:
+    """Append a contradiction node UNDER THE PROJECT LOCK."""
+    research = Path(args.dir).expanduser().resolve() / ".research"
+    xid = args.id or _mint_id(research, "contradictions.jsonl", "X")
+    node = {"id": xid, "critical": bool(args.critical), "resolved": False,
+            "description": args.description, "side_a": args.side_a or "",
+            "side_b": args.side_b or "", "resolution_notes": args.notes or ""}
+    return _locked_append(args, "contradictions.jsonl", node, "contradiction")
+
+
+def cmd_contradiction_resolve(args) -> int:
+    """Mark a contradiction resolved (with note) UNDER THE PROJECT LOCK."""
+    proj = Path(args.dir).expanduser().resolve()
+    research = proj / ".research"
+    fname = research / "contradictions.jsonl"
+    if not fname.exists():
+        print("No contradictions.jsonl.", file=sys.stderr)
+        return 1
+    try:
+        with _project_lock(proj, timeout=max(1.0, float(getattr(args, "lock_timeout", 10)))):
+            rows = _load_jsonl(fname)
+            target = next((r for r in rows if r.get("id") == args.contradiction), None)
+            if target is None:
+                print(f"contradiction {args.contradiction} not found", file=sys.stderr)
+                return 1
+            target["resolved"] = True
+            target["resolution_notes"] = args.note or target.get("resolution_notes", "")
+            fname.write_text("".join(json.dumps(r) + "\n" for r in rows))
+    except BlockingIOError:
+        print("Project locked by another researcher — contradiction not updated.", file=sys.stderr)
+        return 2
+    print(f"Marked {args.contradiction} resolved")
+    return 0
+
+
+def cmd_report_write(args) -> int:
+    """Write the final-report.md UNDER THE PROJECT LOCK."""
+    proj = Path(args.dir).expanduser().resolve()
+    research = proj / ".research"
+    if not (research / "state.json").exists():
+        print("No state.json. Run `init` first.", file=sys.stderr)
+        return 1
+    body = args.content if getattr(args, "content", None) else ""
+    try:
+        with _project_lock(proj, timeout=max(1.0, float(getattr(args, "lock_timeout", 10)))):
+            (research / "final-report.md").write_text(body)
+    except BlockingIOError:
+        print("Project locked by another researcher — report not written.", file=sys.stderr)
+        return 2
+    print(f"Wrote final-report.md ({len(body)} chars)")
+    return 0
+
+
 def cmd_graph(args) -> int:
     """Summarise the evidence graph: nodes by kind, edges by relationship.
 
@@ -1378,6 +1499,81 @@ def main(argv=None) -> int:
     pfr_u.add_argument("--attempt", action="store_true")
     pfr_u.add_argument("--lock-timeout", dest="lock_timeout", type=float, default=10)
     pfr_u.set_defaults(fn=cmd_frontier_update)
+
+    # --- v0.2.4: lock the remaining mutations (search-log / dead-end / criterion / contradiction / report) ---
+    pslog = sub.add_parser("search-log", help="add a search-log entry — LOCKED write")
+    pslog_sub = pslog.add_subparsers(dest="op", required=True)
+    pslog_a = pslog_sub.add_parser("add", help="append a search-log entry")
+    pslog_a.add_argument("dir")
+    pslog_a.add_argument("--query", required=True)
+    pslog_a.add_argument("--strategy", default=None)
+    pslog_a.add_argument("--results", type=int, default=0)
+    pslog_a.add_argument("--outcome", default=None)
+    pslog_a.add_argument("--lock-timeout", dest="lock_timeout", type=float, default=10)
+    pslog_a.set_defaults(fn=cmd_searchlog_add)
+
+    pde = sub.add_parser("dead-end", help="add a dead-end branch — LOCKED write")
+    pde_sub = pde.add_subparsers(dest="op", required=True)
+    pde_a = pde_sub.add_parser("add", help="append a dead-end")
+    pde_a.add_argument("dir")
+    pde_a.add_argument("--description", required=True)
+    pde_a.add_argument("--parent", default=None)
+    pde_a.add_argument("--id", default=None)
+    pde_a.add_argument("--attempted", default=None)
+    pde_a.add_argument("--queries", default=None)
+    pde_a.add_argument("--sources", default=None)
+    pde_a.add_argument("--why-failed", default=None)
+    pde_a.add_argument("--may-reopen", action="store_true")
+    pde_a.add_argument("--reopen-conditions", default=None)
+    pde_a.add_argument("--lock-timeout", dest="lock_timeout", type=float, default=10)
+    pde_a.set_defaults(fn=cmd_deadend_add)
+
+    pcrit = sub.add_parser("criterion", help="add/update acceptance criteria — LOCKED writes")
+    pcrit_sub = pcrit.add_subparsers(dest="op", required=True)
+    pcrit_a = pcrit_sub.add_parser("add", help="append a criterion")
+    pcrit_a.add_argument("dir")
+    pcrit_a.add_argument("--description", required=True)
+    pcrit_a.add_argument("--evidence-required", default=None)
+    pcrit_a.add_argument("--corroboration", action="store_true")
+    pcrit_a.add_argument("--primary-hard", action="store_true")
+    pcrit_a.add_argument("--id", default=None)
+    pcrit_a.add_argument("--lock-timeout", dest="lock_timeout", type=float, default=10)
+    pcrit_a.set_defaults(fn=cmd_criterion_add)
+    pcrit_u = pcrit_sub.add_parser("update", help="update a criterion")
+    pcrit_u.add_argument("dir")
+    pcrit_u.add_argument("criterion")
+    pcrit_u.add_argument("--met", default=None, help="1/0")
+    pcrit_u.add_argument("--evidence", default=None, help="comma-separated source ids")
+    pcrit_u.add_argument("--exception", default=None)
+    pcrit_u.add_argument("--lock-timeout", dest="lock_timeout", type=float, default=10)
+    pcrit_u.set_defaults(fn=cmd_criterion_update)
+
+    pcon = sub.add_parser("contradiction", help="add/resolve contradictions — LOCKED writes")
+    pcon_sub = pcon.add_subparsers(dest="op", required=True)
+    pcon_a = pcon_sub.add_parser("add", help="append a contradiction")
+    pcon_a.add_argument("dir")
+    pcon_a.add_argument("--description", required=True)
+    pcon_a.add_argument("--critical", action="store_true")
+    pcon_a.add_argument("--side-a", default=None)
+    pcon_a.add_argument("--side-b", default=None)
+    pcon_a.add_argument("--notes", default=None)
+    pcon_a.add_argument("--id", default=None)
+    pcon_a.add_argument("--lock-timeout", dest="lock_timeout", type=float, default=10)
+    pcon_a.set_defaults(fn=cmd_contradiction_add)
+    pcon_r = pcon_sub.add_parser("resolve", help="mark a contradiction resolved")
+    pcon_r.add_argument("dir")
+    pcon_r.add_argument("contradiction")
+    pcon_r.add_argument("--note", default=None)
+    pcon_r.add_argument("--lock-timeout", dest="lock_timeout", type=float, default=10)
+    pcon_r.set_defaults(fn=cmd_contradiction_resolve)
+
+    prep = sub.add_parser("report", help="write final-report.md — LOCKED write")
+    prep_sub = prep.add_subparsers(dest="op", required=True)
+    prep_w = prep_sub.add_parser("write", help="write the report body")
+    prep_w.add_argument("dir")
+    prep_w.add_argument("--content", required=True)
+    prep_w.add_argument("--lock-timeout", dest="lock_timeout", type=float, default=10)
+    prep_w.set_defaults(fn=cmd_report_write)
 
     args = p.parse_args(argv)
     return args.fn(args)

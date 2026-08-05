@@ -233,13 +233,31 @@ Two independent layers stop two ticks from mutating the same project:
 2. **Per-mutation project lock (Design 2).** Every shared-state write goes through a
    CLI command that acquires an exclusive `flock` on `<proj>/.research/.lock` for that
    single operation: `source add`, `claim add`, `frontier add`/`update`, `edge`,
-   `resignal`, `checkpoint`, and `tick`. The agent's browsing (web search / extraction)
-   is NOT wrapped in a single whole-session flock (Hermes tool calls are not shell
-   commands inside `subprocess.run`); instead, the lock is held per state mutation, so
-   `sources.jsonl` / `claims.jsonl` / `frontier.jsonl` / `state.json` / `edges.jsonl`
-   are always written by a serialized critical section. A locked command that finds the
-   project already locked exits code 2 ("locked") without mutating anything. This also
-   protects a manual run colliding with a cron run (different processes).
+   `resignal`, `checkpoint`, `tick`, `search-log add`, `dead-end add`, `criterion add/
+   update`, `contradiction add/resolve`, `report write`. The agent's browsing (web search /
+   extraction) is NOT wrapped in a single whole-session flock (Hermes tool calls are not
+   shell commands inside `subprocess.run`); instead, the lock is held per state mutation,
+   so every file under `.research/` (`sources.jsonl`, `claims.jsonl`, `frontier.jsonl`,
+   `state.json`, `edges.jsonl`, `search-log.jsonl`, `dead-ends.jsonl`, `criteria.jsonl`,
+   `contradictions.jsonl`, `final-report.md`) is always written by a serialized critical
+   section. A locked command that finds the project already locked exits code 2 ("locked")
+   without mutating anything. This also protects a manual run colliding with a cron run
+   (different processes).
+
+3. **Worker lease (one worker per campaign).** A cron PRE-RUN script
+   (`scripts/campaign-lease-gate.py`, attached to the research job as `script=`) decides
+   whether to spawn an agent at all. It is TOKEN-based (a random `run_id`), NOT PID-based
+   — the gate process exits before the Hermes session runs, so PID liveness cannot
+   represent the agent. CHECK acquires the project flock and, reading-deciding-writing
+   under one lock, emits `{"wakeAgent": false}` (skip, zero model tokens) when a live
+   lease (within TTL) exists or the state is DORMANT/SUCCESS/EXHAUSTED/missing; otherwise
+   it writes a fresh lease and emits `{"run_id": ...}` (wake). The agent calls
+   `HEARTBEAT <proj> --run-id <R>` to renew ownership past TTL, and releases ownership at
+   the end via `RELEASE <proj> --run-id <R>` (STRICT: only the matching run_id clears it;
+   there is no anonymous release). An expired lease is automatically recoverable after a
+   crash. This closes a gap the Hermes scheduler in-flight guard (which only blocks the
+   SAME cron job id) cannot: a manual run, a second cron job, another profile, or a
+   separately launched script.
 
 Layer 1 is the primary overlap guard; layer 2 is belt-and-suspenders for the project's
 own state files.

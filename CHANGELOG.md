@@ -6,6 +6,34 @@ adheres to [Semantic Versioning](https://semver.org/) (with `v0.x` pre-1.0 seman
 
 ## [Unreleased]
 
+## [0.2.4] — 2026-08-05
+### Fixed (correct one-worker-per-campaign lease + complete mutation locking)
+The audit found the v0.2.3 lease was PID-based (gate PID dies before the agent runs),
+non-atomic (read-decide-write not under the flock), and RELEASE over-deleted
+(unconditional unlink + allowed anonymous release). All corrected:
+
+- **Token-based lease** (`secrets.run_id`); no reliance on the pre-run gate's PID, because
+  that process exits before the Hermes agent session starts. Only TTL/heartbeat decide
+  liveness, so a crashed/exited gate or agent is handled by expiry, not process-life.
+- **Atomic acquisition.** CHECK holds the project flock while it reads state + lease and
+  writes the new lease, so two gates starting at the same instant cannot both wake an
+  agent (verified: 6 concurrent CHECKs -> exactly 1 owner). Matches the design's request
+  to acquire the lock before creating the lease.
+- **Strict RELEASE ownership.** `RELEASE` requires `--run-id` (no anonymous release) and
+  only deletes the lease if the run_id matches; wrong/unknown run_id is refused and the
+  lease is PRESERVED. (Fixes the "deleted before ownership check" and the
+  "run_id None authorises deletion" bugs.)
+- **New `HEARTBEAT` mode.** The research agent refreshes `heartbeat_at`/`expires_at` for
+  its run_id during a long session so it does not lose ownership at TTL expiry.
+- **Locked every remaining mutation.** New locked CLI commands cover the files the cron
+  prompt previously let the agent edit directly: `search-log add`, `dead-end add`,
+  `criterion add/update`, `contradiction add/resolve`, `report write`. The research prompt
+  now routes ALL shared-state writes through locked CLI and forbids hand-editing any file
+  under `.research/`.
+- **Tests:** rewritten lease suite (13) covering simultaneous-acquire, gate-PID-dies,
+  anonymous/wrong-run-id release refusal, heartbeat renewal; plus locked-mutation suite
+  (6). Suite: 63 → **75 tests**, all green (incl. Python 3.9 parse check).
+
 ## [0.2.3] — 2026-08-05
 ### Added (one worker per campaign — cron pre-run lease gate)
 - **`scripts/campaign-lease-gate.py`** — a Hermes cron `script=` pre-run gate that emits
