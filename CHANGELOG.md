@@ -6,6 +6,29 @@ adheres to [Semantic Versioning](https://semver.org/) (with `v0.x` pre-1.0 seman
 
 ## [Unreleased]
 
+## [0.2.3] — 2026-08-05
+### Added (one worker per campaign — cron pre-run lease gate)
+- **`scripts/campaign-lease-gate.py`** — a Hermes cron `script=` pre-run gate that emits
+  `{"wakeAgent": false}` to SKIP the agent run entirely (zero model tokens) when:
+  - another **live worker** holds the campaign lease (recent heartbeat + alive PID), OR
+  - the campaign state is **DORMANT / SUCCESS / EXHAUSTED**, OR
+  - `state.json` is unreadable (conservative safety).
+  Otherwise it acquires a recoverable lease (`run_id`, `pid`, `heartbeat_at`,
+  `expires_at`) under `<project>/.research/.worker-lease.json`. Expired leases with a
+  dead PID are treated as stale and recovered (a crash can't wedge the campaign).
+  A `RELEASE` mode clears the lease at the end of a tick.
+- This directly implements the **one-worker-per-campaign** guarantee. It complements
+  (not replaces) Hermes' scheduler in-flight guard (`_running_job_ids`, which only
+  blocks the SAME cron job); the lease also blocks manual runs, a second cron job,
+  another profile, or a separately launched script.
+- **Tests:** `test_campaign_lease.py` (7 tests) — active acquires lease, dormant/success
+  skip, live-worker blocks concurrent, expired-lease recovery, release clears, missing
+  state skips. Suite: 56 → **63 tests**.
+
+### Changed
+- `research-cron-prompt.md` now instructs the agent to **RELEASE its worker lease** at
+  the end of each tick so the next cron fire can immediately re-acquire it.
+
 ## [0.2.2] — 2026-08-05
 ### Added (Design 2: lock every shared-state write)
 - **Locked mutation primitives.** New `source add`, `claim add`, `frontier add`,

@@ -98,19 +98,21 @@ endless-research status ~/research/my-campaign
 
 **4. Schedule the two cron jobs** (see the **separate** ready-to-paste prompts,
 `templates/research-cron-prompt.md` and `templates/dormant-watcher-prompt.md` — do NOT
-combine both into one job):
+combine both into one job). Each cron fire starts a **fresh** Hermes session that loads
+the campaign from disk, runs one bounded burst, and checkpoints — the campaign, not the
+session, is persistent.
 
-- **Job 1 — research digger:** `every 2h`, fires on `CONTINUE/CHECKPOINT/BLOCKED`,
-  auto-pauses on `DORMANT/SUCCESS/EXHAUSTED`.
-- **Job 2 — dormant watcher:** daily, probes a `DORMANT` campaign for genuinely new
-  evidence (≤3 searches) and re-awakens it.
-
-Example scheduling with Hermes:
+Attach the **worker-lease gate** to the research job (so only one worker runs per
+campaign; it also skips the agent entirely when dormant/finished):
 
 ```bash
-# Job 1 (research) — research-only prompt
+# install the pre-run gate (once)
+cp scripts/campaign-lease-gate.py ~/.hermes/scripts/campaign-lease-gate.py
+
+# Job 1 (research) — research-only prompt + lease-gate pre-run script
 hermes cron add --every 2h --name "my-campaign research" \
   --workdir "$HOME/research/my-campaign" \
+  --script "campaign-lease-gate.py" \
   --skills endless-research --prompt "$(cat templates/research-cron-prompt.md)"
 
 # Job 2 (dormant watcher) — watcher-only prompt
@@ -118,6 +120,10 @@ hermes cron add --every 12h --name "my-campaign dormant-watcher" \
   --workdir "$HOME/research/my-campaign" \
   --skills endless-research --prompt "$(cat templates/dormant-watcher-prompt.md)"
 ```
+
+The lease gate emits `{"wakeAgent": false}` (no model tokens) when another live worker
+holds the lease or the campaign is DORMANT/SUCCESS/EXHAUSTED. The research agent RELEASEs
+its lease at the end of each tick.
 
 See the **full example project** in `examples/demo-project/`.
 

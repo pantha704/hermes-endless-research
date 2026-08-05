@@ -81,6 +81,17 @@ EOF
 chmod +x "$BIN_DIR/endless-research"
 info "Installed launcher: $BIN_DIR/endless-research"
 
+# ---- 3b. install the cron pre-run worker-lease gate --------------------------
+# This lives in the Hermes cron script sandbox so research jobs can attach it as
+# `script=` and skip the agent entirely ({"wakeAgent": false}) when another live
+# worker is active or the campaign is dormant/finished.
+if [ -f "$REPO_ROOT/scripts/campaign-lease-gate.py" ]; then
+  mkdir -p "$HOME/.hermes/scripts"
+  cp "$REPO_ROOT/scripts/campaign-lease-gate.py" "$HOME/.hermes/scripts/campaign-lease-gate.py"
+  chmod +x "$HOME/.hermes/scripts/campaign-lease-gate.py"
+  info "Installed worker-lease gate: ~/.hermes/scripts/campaign-lease-gate.py"
+fi
+
 # Add to PATH in the current shell (and note for future shells)
 if ! echo ":$PATH:" | grep -q ":${BIN_DIR}:"; then
   warn "$BIN_DIR is not on PATH. Add it, e.g.:   export PATH=\"$BIN_DIR:\$PATH\""

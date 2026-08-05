@@ -60,9 +60,14 @@ STEP 4 — Otherwise: `frontier add` quality-gated new clues, log dead branches 
 genuinely appropriate) via `resignal <PROJECT> <STATE> --note "..." --cron <RESEARCH_JOB_ID>`.
 
 STEP 5 — Ensure at least one `checkpoint <PROJECT> --note "<what this tick did>"` runs
-(this also authenticates the round). Deliver a SHORT progress note: current state, what
-was checked, sources/claims/edges added (each via locked CLI), rounds_completed value,
-and the next clue to investigate.
+(this also authenticates the round), then RELEASE your worker lease so the next cron
+fire can immediately re-acquire it:
+    python3 ~/.hermes/scripts/campaign-lease-gate.py RELEASE <PROJECT> --run-id <YOUR_RUN_ID>
+(Your run id was printed by the cron pre-run gate as {"run_id": ...}; if it's unknown,
+call RELEASE without --run-id — it clears a lease owned by this process.)
+
+Deliver a SHORT progress note: current state, what was checked, sources/claims/edges
+added (each via locked CLI), rounds_completed value, and the next clue to investigate.
 
 HARD RULES: Never fabricate a citation, URL, quote, or search result. Never claim a source
 supports more than it does. Multiple pages citing the same original are NOT independent
