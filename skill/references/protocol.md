@@ -230,19 +230,19 @@ Two independent layers stop two ticks from mutating the same project:
    file additionally guarantees only one scheduler sweep runs at a time across
    processes. Interval jobs also schedule the next fire off completion, so the 2h
    cadence is from-finish, not wall-clock.
-2. **Per-mutation project lock (Design 2).** Every shared-state write goes through a
-   CLI command that acquires an exclusive `flock` on `<proj>/.research/.lock` for that
-   single operation: `source add`, `claim add`, `frontier add`/`update`, `edge`,
-   `resignal`, `checkpoint`, `tick`, `search-log add`, `dead-end add`, `criterion add/
-   update`, `contradiction add/resolve`, `report write`. The agent's browsing (web search /
-   extraction) is NOT wrapped in a single whole-session flock (Hermes tool calls are not
-   shell commands inside `subprocess.run`); instead, the lock is held per state mutation,
-   so every file under `.research/` (`sources.jsonl`, `claims.jsonl`, `frontier.jsonl`,
-   `state.json`, `edges.jsonl`, `search-log.jsonl`, `dead-ends.jsonl`, `criteria.jsonl`,
-   `contradictions.jsonl`, `final-report.md`) is always written by a serialized critical
-   section. A locked command that finds the project already locked exits code 2 ("locked")
-   without mutating anything. This also protects a manual run colliding with a cron run
-   (different processes).
+2. **Per-mutation owned project lock (atomic).** Every shared-state write goes through
+   `_owned_project_lock(args)`: it acquires the exclusive `flock` on
+   `<proj>/.research/.lock` and validates lease ownership INSIDE the critical section,
+   then performs the mutation (and mints any automatic id) within the same lock. This
+   closes the check-then-lock race — a command can never observe "no lease" and then
+   write after a cron gate has created one; the lease decision and the mutation are one
+   atomic step. Covered operations: `source add`, `claim add`, `frontier add/update`,
+   `edge`, `search-log add`, `dead-end add`, `criterion add/update`,
+   `contradiction add/resolve`, `report write`, `resignal`, `checkpoint`, `tick`, `reset`,
+   `clarify`. A locked command that finds the project already locked exits code 2; one
+   that lacks ownership under a live lease exits code 3. The agent's browsing (web search /
+   extraction) is not itself wrapped, but every file under `.research/` is written by a
+   serialized, ownership-checked critical section.
 
 3. **Worker lease (one worker per campaign).** A cron PRE-RUN script
    (`scripts/campaign-lease-gate.py`, attached to the research job as `script=`) decides

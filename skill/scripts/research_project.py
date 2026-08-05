@@ -396,12 +396,11 @@ def cmd_resignal(args) -> int:
             return 1
         print()
 
-    # Read-modify-write state.json while holding the project lock (Design 2).
-    guard = _lease_guard(args)
-    if guard:
-        return guard
+    # Atomic lease check + state write under one lock.
     try:
-        with _project_lock(proj, timeout=max(1.0, float(getattr(args, "lock_timeout", 10)))):
+        with _owned_project_lock(args) as owned:
+            if owned.exit_code:
+                return _owned_cm_fail(args, owned.research, "resignal", owned.exit_code)
             state = json.loads(state_f.read_text())
             prev = state.get("current_state", "CONTINUE")
             state["current_state"] = st
@@ -414,8 +413,7 @@ def cmd_resignal(args) -> int:
                         bl.append(args.note)
             state_f.write_text(json.dumps(state, indent=2))
     except BlockingIOError:
-        print("Project locked by another researcher — state not changed.", file=sys.stderr)
-        return 2
+        return _owned_cm_fail(args, proj / ".research", "resignal", 2)
     print(f"State set to {st}.")
 
     # Deterministic cron self-(dis)arming on terminal vs resumable transitions.
@@ -436,28 +434,37 @@ def cmd_reset(args) -> int:
     if not research.exists():
         print("No .research dir. Run `init` first.", file=sys.stderr)
         return 1
-    front = _load_jsonl(research / "frontier.jsonl")
-    if args.frontier or args.all:
-        for f in front:
-            f["status"] = "pending"
-            f["attempts"] = 0
-        research.joinpath("frontier.jsonl").write_text(
-            "".join(json.dumps(f) + "\n" for f in front) or "")
-        print("Frontier reset to pending.")
-    if args.all:
-        research.joinpath("claims.jsonl").write_text("")
-        research.joinpath("dead-ends.jsonl").write_text("")
-        research.joinpath("search-log.jsonl").write_text("")
-        print("Claims/dead-ends/search-log cleared.")
-    state = {}
-    state_f = research / "state.json"
-    if state_f.exists():
-        state = json.loads(state_f.read_text())
-    state["current_state"] = "CONTINUE"
-    state["state_updated"] = _now()
-    state["blockers"] = []
-    state_f.write_text(json.dumps(state, indent=2))
-    print("State reset to CONTINUE.")
+    if not (research / "state.json").exists():
+        print("No state.json. Run `init` first.", file=sys.stderr)
+        return 1
+    # Atomic lease check + destructive rewrites under one lock. A reset while a worker
+    # owns the campaign would erase its evidence, so it must prove ownership or use
+    # --operator-override (deliberate emergency).
+    try:
+        with _owned_project_lock(args) as owned:
+            if owned.exit_code:
+                return _owned_cm_fail(args, owned.research, "reset", owned.exit_code)
+            front = _load_jsonl(research / "frontier.jsonl")
+            if args.frontier or args.all:
+                for f in front:
+                    f["status"] = "pending"
+                    f["attempts"] = 0
+                (research / "frontier.jsonl").write_text(
+                    "".join(json.dumps(f) + "\n" for f in front) or "")
+                print("Frontier reset to pending.")
+            if args.all:
+                (research / "claims.jsonl").write_text("")
+                (research / "dead-ends.jsonl").write_text("")
+                (research / "search-log.jsonl").write_text("")
+                print("Claims/dead-ends/search-log cleared.")
+            state = json.loads((research / "state.json").read_text())
+            state["current_state"] = "CONTINUE"
+            state["state_updated"] = _now()
+            state["blockers"] = []
+            (research / "state.json").write_text(json.dumps(state, indent=2))
+            print("State reset to CONTINUE.")
+    except BlockingIOError:
+        return _owned_cm_fail(args, research, "reset", 2)
     return 0
 
 
@@ -470,12 +477,11 @@ def cmd_checkpoint(args) -> int:
         return 1
     ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S_%f")  # microsecond suffix avoids same-second collisions
     cp = research / "checkpoints" / f"cp_{ts}.md"
-    # Read-modify-write state.json + checkpoint file under the project lock (Design 2).
-    guard = _lease_guard(args)
-    if guard:
-        return guard
+    # Atomic lease check + state/checkpoint write under one lock.
     try:
-        with _project_lock(proj, timeout=max(1.0, float(getattr(args, "lock_timeout", 10)))):
+        with _owned_project_lock(args) as owned:
+            if owned.exit_code:
+                return _owned_cm_fail(args, owned.research, "checkpoint", owned.exit_code)
             state = json.loads(state_f.read_text())
             body = f"# Checkpoint {ts}\n\nstate       : {state.get('current_state')}\n"
             body += f"next_action : {state.get('next_action')}\nnote        : {args.note or ''}\n"
@@ -483,8 +489,7 @@ def cmd_checkpoint(args) -> int:
             state["last_checkpoint"] = str(cp.relative_to(research))
             state_f.write_text(json.dumps(state, indent=2))
     except BlockingIOError:
-        print("Project locked by another researcher — checkpoint skipped.", file=sys.stderr)
-        return 2
+        return _owned_cm_fail(args, research, "checkpoint", 2)
     print(f"Checkpoint written: {cp}")
     return 0
 
@@ -648,11 +653,12 @@ def cmd_tick(args) -> int:
         return 1
 
     timeout = getattr(args, "lock_timeout", 30)
-    guard = _lease_guard(args)
-    if guard:
-        return guard
     try:
         with _project_lock(proj, timeout=timeout):
+            # INSIDE the lock: validate lease ownership (closes check-then-lock race).
+            if not _check_lease_owner(args, proj, research):
+                _owned_cm_fail(args, research, "tick", 3)
+                return 3
             # Bump the round counter under the lock (single writer).
             state = json.loads(state_f.read_text())
             state["rounds_completed"] = state.get("rounds_completed", 0) + 1
@@ -789,11 +795,12 @@ def cmd_edge(args) -> int:
 
     # Edge may point at a Q-* / P-* node that does not exist yet; mint it later.
     # Work entirely under the lock so node+edge creation is atomic.
-    guard = _lease_guard(args)
-    if guard:
-        return guard
     try:
         with _project_lock(proj, timeout=max(1.0, float(getattr(args, "lock_timeout", 10)))):
+            # INSIDE the lock: validate lease ownership (closes check-then-lock race).
+            if not _check_lease_owner(args, proj, research):
+                _owned_cm_fail(args, research, "edge", 3)
+                return 3
             results = []
             ids_to_ensure = {args.from_id, args.to_id}
 
@@ -894,38 +901,147 @@ def _check_lease_owner(args, proj: Path, research: Path) -> bool:
 
 
 def _lease_guard(args) -> int:
-    """Run BEFORE a mutation: return 0 to proceed, 3 to refuse on lease ownership.
-
-    Enforces the global one-worker contract: IF a live lease exists, the mutation
-    must present the lease's run_id (or an --operator-override). A mutation with no
-    run_id while a live lease is held is REFUSED, closing the "ungated manual worker"
-    gap. With no live lease, manual/administrative mutations are permitted.
-    """
+    """Legacy pre-lock ownership check (kept for backward-compat callers).
+    New/refactored code MUST use _owned_project_lock, which validates INSIDE the
+    flock. This pre-lock version is race-prone and only retained temporarily."""
     proj = Path(args.dir).expanduser().resolve()
     if not _check_lease_owner(args, proj, proj / ".research"):
         return 3
     return 0
 
 
-def _locked_append(args, fname: str, node: dict, label: str) -> int:
-    """Append `node` to `.research/<fname>` under the project lock (+ optional lease guard)."""
-    proj = Path(args.dir).expanduser().resolve()
-    research = proj / ".research"
-    if not (research / "state.json").exists():
+def _owned_cm_fail(args, research, label, exit_code):
+    """Handle a refusal/lock-ABORT consistently for _owned_project_lock callers."""
+    if exit_code == 3:
+        print("REFUSED: campaign has a live worker lease. Pass --run-id <token> to prove "
+              "you own this run, or --operator-override.", file=sys.stderr)
+    elif exit_code == 2:
+        print(f"Project locked by another researcher — {label} not written.", file=sys.stderr)
+    elif exit_code == 1:
         print("No state.json. Run `init` first.", file=sys.stderr)
-        return 1
-    guard = _lease_guard(args)
-    if guard:
-        return guard
+    return exit_code
+
+
+def _locked_append(args, fname: str, node: dict, label: str) -> int:
+    """Append `node` to `.research/<fname>` with ATOMIC ownership+append under one lock.
+
+    If `node` has a placeholder "id": null and `mint` is implied, the caller should use
+    _mint_and_append_locked instead. This variant is for nodes with a fixed id."""
+    research = Path(args.dir).expanduser().resolve() / ".research"
     try:
-        with _project_lock(proj, timeout=max(1.0, float(getattr(args, "lock_timeout", 10)))):
+        with _owned_project_lock(args) as owned:
+            if owned.exit_code:
+                return _owned_cm_fail(args, research, label, owned.exit_code)
             with open(research / fname, "a", encoding="utf-8") as fh:
                 fh.write(json.dumps(node) + "\n")
     except BlockingIOError:
-        print(f"Project locked by another researcher — {label} not added.", file=sys.stderr)
-        return 2
+        return _owned_cm_fail(args, research, label, 2)
     print(f"Added {node.get('id', 'record')} to {fname} (locked)")
     return 0
+
+
+def _mint_and_append_locked(args, fname: str, prefix: str, label: str,
+                            node: dict, id_key: str = "id") -> int:
+    """Atomically mint an id AND append `node` under one flock.
+
+    `node` must carry `id_key: None` (or absent). The id is computed from the current
+    file contents INSIDE the lock (closing the ID-allocation race), the node is filled,
+    then appended within the same critical section (lease check + mint + append).
+    """
+    research = Path(args.dir).expanduser().resolve() / ".research"
+    try:
+        with _owned_project_lock(args) as owned:
+            if owned.exit_code:
+                return _owned_cm_fail(args, research, label, owned.exit_code)
+            nid = _mint_id(research, fname, prefix)   # mint INSIDE lock
+            node2 = dict(node); node2[id_key] = nid
+            with open(research / fname, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(node2) + "\n")
+    except BlockingIOError:
+        return _owned_cm_fail(args, research, label, 2)
+    print(f"Added {nid} to {fname} (locked)")
+    return 0
+
+
+def _owned_project_lock(args):
+    """Context manager: ATOMIC lease-check-then-mutate under the project flock.
+
+    Acquires the project flock FIRST, then validates lease ownership INSIDE the
+    critical section, then yields. This closes the check-then-lock race: the lease
+    read + ownership decision + the mutation share one lock.
+
+    Uses fcntl only (Unix). On timeout raises BlockingIOError.
+
+    Caller inspects .refused / .locked EXIT codes on the returned object, or lets
+    exceptions propagate. Always use as:
+        with _owned_project_lock(args) as owned:
+            if owned.exit: return owned.exit      # REFUSED(3) or LOCKED(2) or ABORT(1)
+            ... mutate ...
+    """
+    import fcntl as _fcntl
+    proj = Path(args.dir).expanduser().resolve()
+    research = proj / ".research"
+    state_f = research / "state.json"
+    if not state_f.exists():
+        return _OwnedCM(proj, research, exit_code=1)  # ABORT: no state.json
+    research.mkdir(parents=True, exist_ok=True)
+    lockfile = research / ".lock"
+    timeout = max(1.0, float(getattr(args, "lock_timeout", 10)))
+    fh = open(lockfile, "a+b")
+    deadline = time.time() + timeout
+    acquired = False
+    try:
+        while True:
+            try:
+                _fcntl.flock(fh.fileno(), _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+                acquired = True
+                break
+            except OSError as e:
+                if getattr(e, "errno", None) not in (11,):  # EWOULDBLOCK/EAGAIN
+                    raise
+                if time.time() >= deadline:
+                    raise BlockingIOError("project lock timeout")
+                time.sleep(0.05)
+        # INSIDE the flock: validate lease ownership
+        if not _check_lease_owner(args, proj, research):
+            cm = _OwnedCM(proj, research, exit_code=3)   # REFUSED by lease ownership
+            cm.set_fh(fh)
+            return cm   # caller must __exit__ to release the lock
+        cm = _OwnedCM(proj, research, exit_code=0)
+        cm.set_fh(fh)
+        return cm
+    except BaseException:
+        _fcntl.flock(fh.fileno(), _fcntl.LOCK_UN)
+        fh.close()
+        raise
+
+
+class _OwnedCM:
+    """Result/handle from _owned_project_lock. Exits the flock on __exit__."""
+    __slots__ = ("proj", "research", "exit_code", "_fh")
+
+    def __init__(self, proj, research, exit_code):
+        self.proj = proj; self.research = research
+        self.exit_code = exit_code; self._fh = None
+
+    def set_fh(self, fh):
+        self._fh = fh
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        if self._fh is not None:
+            import fcntl as _fcntl
+            try:
+                _fcntl.flock(self._fh.fileno(), _fcntl.LOCK_UN)
+            finally:
+                self._fh.close()
+                self._fh = None
+        return False
+
+
+
 
 
 def _mint_id(research: Path, fname: str, prefix: str) -> str:
@@ -944,47 +1060,38 @@ def cmd_source_add(args) -> int:
     Every source write goes through here so the flock guards it. Keeps the original
     url (provenance) and the canonical_url.
     """
-    research = Path(args.dir).expanduser().resolve() / ".research"
-    sid = args.id or _mint_id(research, "sources.jsonl", "SRC")
     canon = canonicalize_url(args.url) if args.url else None
     node = {
-        "id": sid,
-        "url": args.url,
-        "canonical_url": canon,
-        "title": args.title or "",
-        "author": args.author,
-        "publisher": args.publisher,
-        "type": args.type or "primary_author_text",
-        "accessed": args.accessed or _now()[:10],
-        "content_fingerprint": None,
+        "id": None, "url": args.url, "canonical_url": canon,
+        "title": args.title or "", "author": args.author,
+        "publisher": args.publisher, "type": args.type or "primary_author_text",
+        "accessed": args.accessed or _now()[:10], "content_fingerprint": None,
         "note": args.note or "",
     }
-    return _locked_append(args, "sources.jsonl", node, "source")
+    if getattr(args, "id", None):
+        node["id"] = args.id
+        return _locked_append(args, "sources.jsonl", node, "source")
+    return _mint_and_append_locked(args, "sources.jsonl", "SRC", "source", node)
 
 
 def cmd_claim_add(args) -> int:
-    """Append a claim (CLM-*) to claims.jsonl UNDER THE PROJECT LOCK."""
-    research = Path(args.dir).expanduser().resolve() / ".research"
-    cid = args.id or _mint_id(research, "claims.jsonl", "CLM")
+    """Append a claim (CLM-*) to claims.jsonl UNDER THE PROJECT LOCK (atomic mint)."""
     srcs = [s.strip() for s in (args.sources or "").split(",") if s.strip()]
     node = {
-        "id": cid,
-        "claim": args.claim,
-        "status": args.status or "strong",
-        "confidence": args.confidence or "high",
-        "sources": srcs,
-        "technique": args.technique or "",
-        "verification_note": args.note or "",
+        "id": None, "claim": args.claim, "status": args.status or "strong",
+        "confidence": args.confidence or "high", "sources": srcs,
+        "technique": args.technique or "", "verification_note": args.note or "",
     }
-    return _locked_append(args, "claims.jsonl", node, "claim")
+    if getattr(args, "id", None):
+        node["id"] = args.id
+        return _locked_append(args, "claims.jsonl", node, "claim")
+    return _mint_and_append_locked(args, "claims.jsonl", "CLM", "claim", node)
 
 
 def cmd_frontier_add(args) -> int:
-    """Append a clue (CLUE-*) to frontier.jsonl UNDER THE PROJECT LOCK."""
-    research = Path(args.dir).expanduser().resolve() / ".research"
-    cid = args.id or _mint_id(research, "frontier.jsonl", "CLUE")
+    """Append a clue (CLUE-*) to frontier.jsonl UNDER THE PROJECT LOCK (atomic mint)."""
     node = {
-        "clue_id": cid,
+        "clue_id": None,
         "description": args.description,
         "parent": args.parent,
         "depth": int(args.depth or 1),
@@ -997,18 +1104,20 @@ def cmd_frontier_add(args) -> int:
         "status": "pending",
         "attempts": 0,
     }
-    return _locked_append(args, "frontier.jsonl", node, "clue")
+    if getattr(args, "id", None):
+        node["clue_id"] = args.id
+        return _locked_append(args, "frontier.jsonl", node, "clue")
+    return _mint_and_append_locked(args, "frontier.jsonl", "CLUE", "clue", node,
+                                   id_key="clue_id")
 
 
 def cmd_frontier_update(args) -> int:
-    """Update a clue's status/attempts UNDER THE PROJECT LOCK."""
-    proj = Path(args.dir).expanduser().resolve()
-    research = proj / ".research"
-    if not (research / "state.json").exists():
-        print("No state.json. Run `init` first.", file=sys.stderr)
-        return 1
+    """Update a clue's status/attempts ATOMICALLY (lease check + rewrite under one lock)."""
+    research = Path(args.dir).expanduser().resolve() / ".research"
     try:
-        with _project_lock(proj, timeout=max(1.0, float(getattr(args, "lock_timeout", 10)))):
+        with _owned_project_lock(args) as owned:
+            if owned.exit_code:
+                return _owned_cm_fail(args, owned.research, "frontier", owned.exit_code)
             rows = _load_jsonl(research / "frontier.jsonl")
             hit = False
             for r in rows:
@@ -1020,11 +1129,10 @@ def cmd_frontier_update(args) -> int:
             if not hit:
                 print(f"clue {args.clue} not found", file=sys.stderr)
                 return 1
-            research.joinpath("frontier.jsonl").write_text(
+            (research / "frontier.jsonl").write_text(
                 "".join(json.dumps(r) + "\n" for r in rows))
     except BlockingIOError:
-        print("Project locked by another researcher — frontier not updated.", file=sys.stderr)
-        return 2
+        return _owned_cm_fail(args, research, "frontier", 2)
     print(f"Updated {args.clue} (status={args.status or 'unchanged'})")
     return 0
 
@@ -1042,10 +1150,8 @@ def cmd_searchlog_add(args) -> int:
 
 
 def cmd_deadend_add(args) -> int:
-    """Append a dead-end branch UNDER THE PROJECT LOCK."""
-    research = Path(args.dir).expanduser().resolve() / ".research"
-    did = args.id or _mint_id(research, "dead-ends.jsonl", "DE")
-    node = {"clue_id": did, "from_source": args.parent,
+    """Append a dead-end branch UNDER THE PROJECT LOCK (atomic mint)."""
+    node = {"clue_id": None, "from_source": args.parent,
             "description": args.description,
             "attempted": args.attempted or "",
             "queries": args.queries or "",
@@ -1053,34 +1159,37 @@ def cmd_deadend_add(args) -> int:
             "why_failed": args.why_failed or "",
             "may_reopen": bool(args.may_reopen),
             "reopen_conditions": args.reopen_conditions or ""}
-    return _locked_append(args, "dead-ends.jsonl", node, "dead-end")
+    if getattr(args, "id", None):
+        node["clue_id"] = args.id
+        return _locked_append(args, "dead-ends.jsonl", node, "dead-end")
+    return _mint_and_append_locked(args, "dead-ends.jsonl", "DE", "dead-end", node,
+                                   id_key="clue_id")
 
 
 def cmd_criterion_add(args) -> int:
-    """Append an acceptance criterion UNDER THE PROJECT LOCK."""
-    research = Path(args.dir).expanduser().resolve() / ".research"
-    cid = args.id or _mint_id(research, "criteria.jsonl", "C")
-    node = {"id": cid, "description": args.description,
+    """Append an acceptance criterion UNDER THE PROJECT LOCK (atomic mint)."""
+    node = {"id": None, "description": args.description,
             "evidence_required": args.evidence_required or "primary_or_exception",
             "corroboration_required": bool(args.corroboration),
             "primary_hard": bool(args.primary_hard),
             "met": False, "evidence_source_ids": [], "exception": None}
-    return _locked_append(args, "criteria.jsonl", node, "criterion")
+    if getattr(args, "id", None):
+        node["id"] = args.id
+        return _locked_append(args, "criteria.jsonl", node, "criterion")
+    return _mint_and_append_locked(args, "criteria.jsonl", "C", "criterion", node)
 
 
 def cmd_criterion_update(args) -> int:
-    """Update a criterion (met / evidence / exception) UNDER THE PROJECT LOCK."""
-    proj = Path(args.dir).expanduser().resolve()
-    research = proj / ".research"
+    """Update a criterion (met / evidence / exception) ATOMICALLY (lease check under lock)."""
+    research = Path(args.dir).expanduser().resolve() / ".research"
     fname = research / "criteria.jsonl"
-    if not fname.exists():
-        print("No criteria.jsonl. Run `init` first.", file=sys.stderr)
-        return 1
-    guard = _lease_guard(args)
-    if guard:
-        return guard
     try:
-        with _project_lock(proj, timeout=max(1.0, float(getattr(args, "lock_timeout", 10)))):
+        with _owned_project_lock(args) as owned:
+            if owned.exit_code:
+                return _owned_cm_fail(args, owned.research, "criterion", owned.exit_code)
+            if not fname.exists():
+                print("No criteria.jsonl. Run `init` first.", file=sys.stderr)
+                return 1
             rows = _load_jsonl(fname)
             target = next((r for r in rows if r.get("id") == args.criterion), None)
             if target is None:
@@ -1094,35 +1203,33 @@ def cmd_criterion_update(args) -> int:
                 target["exception"] = args.exception or None
             fname.write_text("".join(json.dumps(r) + "\n" for r in rows))
     except BlockingIOError:
-        print("Project locked by another researcher — criterion not updated.", file=sys.stderr)
-        return 2
+        return _owned_cm_fail(args, research, "criterion", 2)
     print(f"Updated criterion {args.criterion}")
     return 0
 
 
 def cmd_contradiction_add(args) -> int:
-    """Append a contradiction node UNDER THE PROJECT LOCK."""
-    research = Path(args.dir).expanduser().resolve() / ".research"
-    xid = args.id or _mint_id(research, "contradictions.jsonl", "X")
-    node = {"id": xid, "critical": bool(args.critical), "resolved": False,
+    """Append a contradiction node UNDER THE PROJECT LOCK (atomic mint)."""
+    node = {"id": None, "critical": bool(args.critical), "resolved": False,
             "description": args.description, "side_a": args.side_a or "",
             "side_b": args.side_b or "", "resolution_notes": args.notes or ""}
-    return _locked_append(args, "contradictions.jsonl", node, "contradiction")
+    if getattr(args, "id", None):
+        node["id"] = args.id
+        return _locked_append(args, "contradictions.jsonl", node, "contradiction")
+    return _mint_and_append_locked(args, "contradictions.jsonl", "X", "contradiction", node)
 
 
 def cmd_contradiction_resolve(args) -> int:
-    """Mark a contradiction resolved (with note) UNDER THE PROJECT LOCK."""
-    proj = Path(args.dir).expanduser().resolve()
-    research = proj / ".research"
+    """Mark a contradiction resolved (with note) ATOMICALLY (lease check under lock)."""
+    research = Path(args.dir).expanduser().resolve() / ".research"
     fname = research / "contradictions.jsonl"
-    if not fname.exists():
-        print("No contradictions.jsonl.", file=sys.stderr)
-        return 1
-    guard = _lease_guard(args)
-    if guard:
-        return guard
     try:
-        with _project_lock(proj, timeout=max(1.0, float(getattr(args, "lock_timeout", 10)))):
+        with _owned_project_lock(args) as owned:
+            if owned.exit_code:
+                return _owned_cm_fail(args, owned.research, "contradiction", owned.exit_code)
+            if not fname.exists():
+                print("No contradictions.jsonl.", file=sys.stderr)
+                return 1
             rows = _load_jsonl(fname)
             target = next((r for r in rows if r.get("id") == args.contradiction), None)
             if target is None:
@@ -1132,29 +1239,25 @@ def cmd_contradiction_resolve(args) -> int:
             target["resolution_notes"] = args.note or target.get("resolution_notes", "")
             fname.write_text("".join(json.dumps(r) + "\n" for r in rows))
     except BlockingIOError:
-        print("Project locked by another researcher — contradiction not updated.", file=sys.stderr)
-        return 2
+        return _owned_cm_fail(args, research, "contradiction", 2)
     print(f"Marked {args.contradiction} resolved")
     return 0
 
 
 def cmd_report_write(args) -> int:
-    """Write the final-report.md UNDER THE PROJECT LOCK."""
-    proj = Path(args.dir).expanduser().resolve()
-    research = proj / ".research"
+    """Write the final-report.md ATOMICALLY (lease check under lock)."""
+    research = Path(args.dir).expanduser().resolve() / ".research"
     if not (research / "state.json").exists():
         print("No state.json. Run `init` first.", file=sys.stderr)
         return 1
     body = args.content if getattr(args, "content", None) else ""
-    guard = _lease_guard(args)
-    if guard:
-        return guard
     try:
-        with _project_lock(proj, timeout=max(1.0, float(getattr(args, "lock_timeout", 10)))):
+        with _owned_project_lock(args) as owned:
+            if owned.exit_code:
+                return _owned_cm_fail(args, owned.research, "report", owned.exit_code)
             (research / "final-report.md").write_text(body)
     except BlockingIOError:
-        print("Project locked by another researcher — report not written.", file=sys.stderr)
-        return 2
+        return _owned_cm_fail(args, research, "report", 2)
     print(f"Wrote final-report.md ({len(body)} chars)")
     return 0
 
@@ -1498,7 +1601,9 @@ def cmd_clarify(args) -> int:
             "## Success conditions (define these; the SUCCESS gate checks criteria.jsonl)",
             "- (_edit_)",
         ]
-        with _project_lock(proj, timeout=max(1.0, float(getattr(args, "lock_timeout", 10)))):
+        with _owned_project_lock(args) as owned:
+            if owned.exit_code:
+                return _owned_cm_fail(args, owned.research, "clarify", owned.exit_code)
             obj_path.write_text("\n".join(lines) + "\n")
         print(f"compiled objective -> {obj_path}")
     return 0
@@ -1542,6 +1647,10 @@ def main(argv=None) -> int:
     prs.add_argument("--state", action="store_true", help="reset state to CONTINUE")
     prs.add_argument("--frontier", action="store_true", help="mark frontier pending")
     prs.add_argument("--all", action="store_true", help="reset frontier+evidence+state")
+    prs.add_argument("--run-id", default=None, help="prove ownership of the active worker lease")
+    prs.add_argument("--operator-override", action="store_true",
+                     help="force a reset despite a live worker lease (emergency)")
+    prs.add_argument("--lock-timeout", dest="lock_timeout", type=float, default=10)
     prs.set_defaults(fn=cmd_reset)
 
     pc = sub.add_parser("checkpoint", help="snapshot now")
@@ -1604,6 +1713,9 @@ def main(argv=None) -> int:
                      help="clear -> compile; vague -> defaults; ambiguous -> ask questions")
     pc2.add_argument("--no-write", action="store_true", help="do not overwrite objective.md")
     pc2.add_argument("--lock-timeout", dest="lock_timeout", type=float, default=10)
+    pc2.add_argument("--run-id", default=None, help="prove ownership of the active worker lease")
+    pc2.add_argument("--operator-override", action="store_true",
+                     help="force the objective write despite a live lease (emergency)")
     pc2.set_defaults(fn=cmd_clarify)
 
     pwrap = sub.add_parser("cron-wrapper",

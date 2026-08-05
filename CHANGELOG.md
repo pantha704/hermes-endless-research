@@ -6,6 +6,27 @@ adheres to [Semantic Versioning](https://semver.org/) (with `v0.x` pre-1.0 seman
 
 ## [Unreleased]
 
+## [0.2.7] — 2026-08-06
+### Fixed (atomic ownership contract — check-then-lock race closed)
+The audit found ownership was validated BEFORE the flock was acquired (a race: a check
+seeing 'no lease' could then write after a cron gate created one), plus `frontier update`,
+`reset`, and `clarify` bypasses, and non-atomic ID minting. All closed:
+
+- **`_owned_project_lock(args)`** — a context manager that acquires the project flock and
+  validates lease ownership INSIDE the critical section, then yields. Every mutation
+  routes through it (or an equivalent in-lock check), so check-then-mutate are one atomic
+  step. A mutation can no longer observe a stale 'no lease'.
+- **`frontier update`** now enforces ownership (was a direct `_project_lock` bypass).
+- **`reset`** now holds the owned lock and requires `--run-id`/`--operator-override` when a
+  worker is active (was an unprotected erase of frontier/claims/dead-ends/search-log/state).
+- **`clarify`** now enforces ownership when writing `objective.md` (was locked but ungated).
+- **Atomic ID allocation** — `_mint_id` moved inside the locked transaction
+  (`_mint_and_append_locked`), so concurrent `source/claim/frontier/dead-end/criterion/
+  contradiction add` calls cannot mint duplicate ids.
+- **Tests:** new `test_atomic_ownership.py` (5: in-lock ownership, concurrent serialization,
+  no-duplicate id minting, frontier-update refusal, reset refusal+override). Suite: 86 → **91**,
+  all green (incl. Python 3.9 parse check).
+
 ## [0.2.6] — 2026-08-06
 ### Fixed (edge/resignal/tick ownership — found by the real cron lifecycle test)
 The decisive real-Hermes-cron lifecycle test (gate → token → locked mutation → release)
