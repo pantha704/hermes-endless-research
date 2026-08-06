@@ -259,12 +259,17 @@ Two independent layers stop two ticks from mutating the same project:
    SAME cron job id) cannot: a manual run, a second cron job, another profile, or a
    separately launched script.
 
-   Lease safety is FAIL-CLOSED: an absent lease allows manual writes; a readable but
-   expired lease allows; a readable live lease requires the matching `--run-id`;
-   a lease that is PRESENT but unreadable/corrupt REFUSES all mutations (unless
-   `--operator-override`), because we cannot prove the worker is gone. The gate writes
-   the lease atomically (temp file + `os.replace`) so a crash cannot leave a truncated
-   lease. Explicit `--id` must be unique (duplicate ids are rejected with exit 4).
+   Lease safety is FAIL-CLOSED **in both the mutation layer and the cron gate**. An
+   absent lease allows manual writes / gate acquisition; a readable but expired lease
+   allows re-acquisition; a readable live lease requires the matching `--run-id`
+   (mutations) or emits `wakeAgent:false` (gate); a lease that is PRESENT but
+   unreadable/corrupt REFUSES all mutations AND makes the gate produce `wakeAgent:false`
+   with a recovery warning (the gate never auto-takeovers an unreadable lease — recovery
+   is an explicit `RELEASE --operator-override` admin action). The gate writes the lease
+   atomically (temp + `os.fsync` + `os.replace` + parent-dir fsync) so no crash can leave
+   a truncated lease. Explicit `--id` must carry the correct type prefix (`SRC-`/`CLM-`/
+   `CLUE-`/`DE-`/`C-`/`X-` per command) and be unique in its target file (duplicates exit
+   4, wrong prefix exit 5).
 
 4. **Identifier schema is type-aware.** Frontier (`CLUE-*`) and dead-end (`DE-*`) records
    store their id under `clue_id`; all other node types use `id`. `_mint_id` and

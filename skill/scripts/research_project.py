@@ -968,24 +968,53 @@ def _owned_cm_fail(args, research, label, exit_code):
     return exit_code
 
 
-def _locked_append(args, fname: str, node: dict, label: str) -> int:
+def _find_id_in_file(research: Path, fname: str, id_value: str, id_key: str) -> bool:
+    """True if id_value appears under id_key in .research/<fname>."""
+    try:
+        for row in _load_jsonl(research / fname):
+            if str(row.get(id_key)) == str(id_value):
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def _locked_append(args, fname: str, node: dict, label: str,
+                   expected_prefix: str = None) -> int:
     """Append `node` to `.research/<fname>` with ATOMIC ownership+append under one lock.
 
-    If `node` carries an explicit id (id or clue_id), it is checked for uniqueness
-    INSIDE the lock so duplicate explicit ids are rejected. If `id` is a placeholder
-    (None) the caller should use _mint_and_append_locked instead.
+    If `node` carries an explicit id (id or clue_id), it is validated INSIDE the lock:
+      1. The id's prefix must match `expected_prefix` (e.g. SRC- for a source). A
+         mismatched prefix is rejected (exit 5) — this prevents a source being written
+         with a CLM-* id, which would silent-break graph resolution.
+      2. The id must not already exist in the TARGET file under its declared key
+         (exit 4 = DUPLICATE_ID).
+    Automatic minting (id: None) is handled by _mint_and_append_locked instead.
     """
     research = Path(args.dir).expanduser().resolve() / ".research"
     try:
         with _owned_project_lock(args) as owned:
             if owned.exit_code:
                 return _owned_cm_fail(args, research, label, owned.exit_code)
-            # Uniqueness check for explicit ids (type-aware key).
             explicit = node.get("id") or node.get("clue_id")
-            if explicit and _node_exists(research, str(explicit)):
-                print(f"REFUSED: duplicate id {explicit} already exists in this campaign. "
-                      f"Choose a different --id or omit it to auto-mint.", file=sys.stderr)
-                return 4   # DUPLICATE_ID
+            if explicit:
+                # 1) Prefix/type validation against the command's expected prefix.
+                if expected_prefix:
+                    if not str(explicit).startswith(expected_prefix + "-"):
+                        print(
+                            f"REFUSED: id {explicit} has wrong prefix for `{label}` — "
+                            f"expected {expected_prefix}-*. Use a valid {expected_prefix}-* "
+                            f"id (or omit --id to auto-mint).",
+                            file=sys.stderr,
+                        )
+                        return 5   # WRONG_PREFIX
+                # 2) Duplicate check against the TARGET file with its declared key.
+                prefix = expected_prefix or (str(explicit).split("-")[0] if "-" in str(explicit) else None)
+                id_key = _node_id_key(prefix) if prefix else "id"
+                if _find_id_in_file(research, fname, str(explicit), id_key):
+                    print(f"REFUSED: duplicate id {explicit} already exists in {fname}.",
+                          file=sys.stderr)
+                    return 4   # DUPLICATE_ID
             with open(research / fname, "a", encoding="utf-8") as fh:
                 fh.write(json.dumps(node) + "\n")
     except BlockingIOError:
@@ -1138,7 +1167,7 @@ def cmd_source_add(args) -> int:
     }
     if getattr(args, "id", None):
         node["id"] = args.id
-        return _locked_append(args, "sources.jsonl", node, "source")
+        return _locked_append(args, "sources.jsonl", node, "source", expected_prefix="SRC")
     return _mint_and_append_locked(args, "sources.jsonl", "SRC", "source", node)
 
 
@@ -1152,7 +1181,7 @@ def cmd_claim_add(args) -> int:
     }
     if getattr(args, "id", None):
         node["id"] = args.id
-        return _locked_append(args, "claims.jsonl", node, "claim")
+        return _locked_append(args, "claims.jsonl", node, "claim", expected_prefix="CLM")
     return _mint_and_append_locked(args, "claims.jsonl", "CLM", "claim", node)
 
 
@@ -1174,7 +1203,7 @@ def cmd_frontier_add(args) -> int:
     }
     if getattr(args, "id", None):
         node["clue_id"] = args.id
-        return _locked_append(args, "frontier.jsonl", node, "clue")
+        return _locked_append(args, "frontier.jsonl", node, "clue", expected_prefix="CLUE")
     return _mint_and_append_locked(args, "frontier.jsonl", "CLUE", "clue", node,
                                    id_key="clue_id")
 
@@ -1229,7 +1258,7 @@ def cmd_deadend_add(args) -> int:
             "reopen_conditions": args.reopen_conditions or ""}
     if getattr(args, "id", None):
         node["clue_id"] = args.id
-        return _locked_append(args, "dead-ends.jsonl", node, "dead-end")
+        return _locked_append(args, "dead-ends.jsonl", node, "dead-end", expected_prefix="DE")
     return _mint_and_append_locked(args, "dead-ends.jsonl", "DE", "dead-end", node,
                                    id_key="clue_id")
 
@@ -1243,7 +1272,7 @@ def cmd_criterion_add(args) -> int:
             "met": False, "evidence_source_ids": [], "exception": None}
     if getattr(args, "id", None):
         node["id"] = args.id
-        return _locked_append(args, "criteria.jsonl", node, "criterion")
+        return _locked_append(args, "criteria.jsonl", node, "criterion", expected_prefix="C")
     return _mint_and_append_locked(args, "criteria.jsonl", "C", "criterion", node)
 
 
@@ -1283,7 +1312,7 @@ def cmd_contradiction_add(args) -> int:
             "side_b": args.side_b or "", "resolution_notes": args.notes or ""}
     if getattr(args, "id", None):
         node["id"] = args.id
-        return _locked_append(args, "contradictions.jsonl", node, "contradiction")
+        return _locked_append(args, "contradictions.jsonl", node, "contradiction", expected_prefix="X")
     return _mint_and_append_locked(args, "contradictions.jsonl", "X", "contradiction", node)
 
 

@@ -6,6 +6,32 @@ adheres to [Semantic Versioning](https://semver.org/) (with `v0.x` pre-1.0 seman
 
 ## [Unreleased]
 
+## [0.2.10] — 2026-08-06
+### Fixed (gate fail-closed corrupt lease + explicit-ID prefix/type validation)
+The audit found the cron gate still failed open on a corrupt lease, and explicit IDs were
+not validated against their type (so `source add --id CLM-0001` could write a claim-prefixed
+id, silently breaking graph resolution).
+
+- **Gate is now fail-closed on a corrupt lease.** `campaign-lease-gate.py` uses the same
+  three-state reader as the mutation layer (absent / readable / present-but-unreadable).
+  `CHECK` on a corrupt lease emits `wakeAgent:false` + a recovery warning and does NOT
+  auto-takeover (a second worker cannot start under an unknown owner). `HEARTBEAT`
+  refuses, `STATUS` reports `corrupt`, and `RELEASE` refuses unless `--operator-override`
+  (the explicit admin recovery). Expired-but-readable leases still re-acquire normally.
+- **Explicit-ID prefix/type validation.** Each command now validates that an explicit
+  `--id` carries the correct prefix for its type and checks for duplicates against the
+  TARGET file with its declared identifier key (not a global guess):
+  `source=SRC-`, `claim=CLM-`, `frontier=CLUE-`, `dead-end=DE-`, `criterion=C-`,
+  `contradiction=X-`. A wrong prefix is rejected (exit **5**); a duplicate in the target
+  file is rejected (exit **4**). A source can therefore no longer carry a `CLM-*` id.
+- **Lease write is fsync-backed** (temp + flush + `os.fsync` + `os.replace` + parent-dir
+  fsync), giving process-crash durability AND power-loss durability for the file/dir, and
+  the wording is corrected to "process-crash-resistant" (not overclaiming "every failure
+  mode").
+- **Tests:** new `test_v210.py` (10): gate corrupt/absent/expired/live/heartbeat/status/
+  release+override + wrong-prefix for all six commands + target-file duplicate + typed
+  coexistence. Suite: 106 → **116**, all green (incl. Python 3.9 parse check).
+
 ## [0.2.9] — 2026-08-06
 ### Fixed (crash-consistency + uniqueness + deterministic barrier)
 The audit found explicit `--id` could still duplicate, a corrupt lease failed open, init's

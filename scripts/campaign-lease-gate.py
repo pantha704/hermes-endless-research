@@ -93,24 +93,50 @@ def _read_state(research: Path):
         return None
 
 
-def _read_lease(research: Path):
+def _read_lease_fail_closed(research: Path):
+    """Read the lease with FAIL-CLOSED semantics (mirrors the mutation layer).
+
+    Returns (lease_dict, None)      readable
+            (None, None)            absent                 -> safe to acquire
+            (None, "unreadable")    present but corrupt    -> FAIL CLOSED
+    """
+    p = research / ".worker-lease.json"
+    if not p.exists():
+        return None, None
     try:
-        return json.loads((research / ".worker-lease.json").read_text())
+        lease = json.loads(p.read_text())
+        if not isinstance(lease, dict):
+            return None, "unreadable"
+        return lease, None
     except Exception:
-        return None
+        return None, "unreadable"
 
 
 def _write_lease(research: Path, lease: dict):
-    """Write the lease CRASH-CONSISTENTLY: temp file + os.replace.
+    """Write the lease PROCESS-CRASH-CONSISTENTLY: temp file + fsync + os.replace.
 
-    A concurrent crash mid-write cannot leave a truncated .worker-lease.json, so the
-    fail-closed reader never sees a corrupt-but-present lease.
+    A concurrent process dying mid-write cannot leave a truncated .worker-lease.json, so
+    the fail-closed reader never sees a corrupt-but-present lease. This guarantees atomic
+    visibility across process crashes; fsync adds durability against kernel crash / power
+    loss for the file and its directory entry.
     """
     (research).mkdir(parents=True, exist_ok=True)
     dest = research / ".worker-lease.json"
     tmp = research / ".worker-lease.json.tmp"
-    tmp.write_text(json.dumps(lease))
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(json.dumps(lease))
+        fh.flush()
+        os.fsync(fh.fileno())
     os.replace(tmp, dest)
+    # fsync the directory so the rename itself is durable (not just the file data).
+    try:
+        dfd = os.open(str(research), os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+    except OSError:
+        pass  # fsync on a directory is not supported on some filesystems; best-effort
 
 
 def _delete_lease(research: Path):
@@ -133,12 +159,25 @@ def check(proj: Path, rp) -> int:
         if state is None or (state.get("current_state") or "CONTINUE").upper() in PAUSE_STATES:
             _emit(wakeAgent=False)
             return 0
-        lease = _read_lease(research)
+        lease, lerr = _read_lease_fail_closed(research)
+        if lerr == "unreadable":
+            # FAIL CLOSED: a present-but-corrupt lease may belong to a live worker.
+            # Do NOT auto-takeover — require explicit admin recovery. This prevents a
+            # second worker from starting while an unknown owner holds the campaign.
+            _emit(
+                wakeAgent=False,
+                warning=(
+                    ".worker-lease.json is present but unreadable/corrupt; refusing to "
+                    "start a worker under an unknown lease owner. Remove the lease "
+                    "deliberately (or run an admin recovery) to resume."
+                ),
+            )
+            return 0
         if lease and lease.get("status") == "running" and (_now() < lease.get("expires_at", 0)):
             # A valid, non-expired lease exists -> another worker owns the campaign.
             _emit(wakeAgent=False)
             return 0
-        # No valid lease -> acquire a new token lease.
+        # No valid lease (absent, or readable-but-expired) -> acquire a new token lease.
         run_id = f"RUN-{secrets.token_hex(8)}"
         now = _now()
         _write_lease(research, {
@@ -158,7 +197,11 @@ def heartbeat(proj: Path, run_id: str, rp) -> int:
         _emit(error="heartbeat requires --run-id")
         return 1
     with rp._project_lock(proj, timeout=10):
-        lease = _read_lease(research)
+        lease, lerr = _read_lease_fail_closed(research)
+        if lerr == "unreadable":
+            _emit(error="heartbeat refused: .worker-lease.json is corrupt/unreadable", 
+                  recovery="remove the lease deliberately or run admin recovery")
+            return 1
         if lease is None:
             _emit(error="no active lease to heartbeat")
             return 1
@@ -179,7 +222,15 @@ def release(proj: Path, run_id: str, rp) -> int:
         _emit(error="release requires --run-id (no anonymous release)")
         return 1
     with rp._project_lock(proj, timeout=10):
-        lease = _read_lease(research)
+        lease, lerr = _read_lease_fail_closed(research)
+        if lerr == "unreadable":
+            if getattr(rp, "_i_am_operator_override", False) or "--operator-override" in sys.argv:
+                _delete_lease(research)
+                _emit(status="released-force", run_id="(corrupt lease overridden)")
+                return 0
+            _emit(error="release refused: .worker-lease.json is corrupt/unreadable",
+                  recovery="use --operator-override to force-clear a corrupt lease")
+            return 1
         if lease is None:
             _emit(status="no active lease")
             return 0
@@ -194,8 +245,10 @@ def release(proj: Path, run_id: str, rp) -> int:
 
 
 def status(proj: Path, rp) -> int:
-    lease = _read_lease(proj / ".research")
-    if lease is None:
+    lease, lerr = _read_lease_fail_closed(proj / ".research")
+    if lerr == "unreadable":
+        _emit(status="corrupt", warning=".worker-lease.json present but unreadable")
+    elif lease is None:
         _emit(status="no-lease")
     else:
         now = _now()
