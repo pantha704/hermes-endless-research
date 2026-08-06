@@ -298,12 +298,12 @@ def cmd_init(args) -> int:
                 else content
             )
             target.write_text(filled)
-
-    script = Path(os.path.abspath(__file__))
-    hermes_md = HERMES_MD.format(name=proj.name, script=script)
-    hfile = proj / "HERMES.md"
-    if not hfile.exists():
-        with _project_lock(proj, timeout=max(1.0, float(getattr(args, "lock_timeout", 10)))):
+        # Write HERMES.md inside the SAME owned critical section so init is atomic (no
+        # window where a gate could acquire a lease between scaffold sections).
+        script = Path(os.path.abspath(__file__))
+        hermes_md = HERMES_MD.format(name=proj.name, script=script)
+        hfile = proj / "HERMES.md"
+        if not hfile.exists():
             hfile.write_text(hermes_md)
 
     print(f"Scaffolded research project at {proj}")
@@ -888,25 +888,52 @@ def cmd_edge(args) -> int:
 # serialized by the project lock. This is the crash-resistant design: a state-changing
 # operation is a single locked CLI call.
 
-def _check_lease_owner(args, proj: Path, research: Path) -> bool:
-    """Enforce optional token ownership on a mutation.
+def _read_lease_fail_closed(research: Path):
+    """Read `.worker-lease.json` with FAIL-CLOSED semantics.
 
-    When a LIVE worker lease exists in `.research/.worker-lease.json`:
-      - if --run-id matches the lease -> permit
-      - if --run-id is missing/wrong -> REFUSE, UNLESS --operator-override
-    When no live lease exists -> a manual/administrative mutation is permitted.
-
-    Returns True to allow the mutation, False to refuse. The caller prints the reason.
+    Returns:
+      (None, None)                    -> lease file absent (allow manual mutation)
+      (lease_dict, None)              -> lease readable (caller applies live/expired rules)
+      (None, "unreadable")            -> lease present but unreadable (corrupt/truncated)
+                                          -> MUST refuse (fail closed)
     """
+    p = research / ".worker-lease.json"
+    if not p.exists():
+        return None, None
     try:
-        lease = json.loads((research / ".worker-lease.json").read_text())
+        lease = json.loads(p.read_text())
+        if not isinstance(lease, dict):
+            return None, "unreadable"
+        return lease, None
     except Exception:
-        return True  # no readable lease -> manual operation permitted
+        return None, "unreadable"
 
-    # Live lease? (running + not expired)
+
+def _check_lease_owner(args, proj: Path, research: Path) -> bool:
+    """Enforce optional token ownership on a mutation (FAIL-CLOSED on corrupt lease).
+
+    - Lease absent      -> permit manual/administrative mutation.
+    - Lease readable+expired -> permit (the worker's claim has lapsed).
+    - Lease readable+live   -> require --run-id == lease.run_id, else REFUSE
+                               (unless --operator-override).
+    - Lease present but UNREADABLE (corrupt/truncated) -> REFUSE (fail closed): we
+      cannot prove the worker is gone, so we must not write under an unknown owner.
+    """
+    lease, err = _read_lease_fail_closed(research)
+    if err == "unreadable":
+        if getattr(args, "operator_override", False):
+            return True  # deliberate emergency override
+        print(f"REFUSED: .worker-lease.json is present but unreadable/corrupt. Refusing "
+              f"to mutate under an unknown lease owner. Fix/remove the lease deliberately, "
+              f"or use --operator-override.", file=sys.stderr)
+        return False
+    if lease is None:
+        return True  # absent -> manual operation permitted
+
+    # Lease readable: live? (running + not expired)
     lease_live = lease.get("status") == "running" and time.time() < lease.get("expires_at", 0)
     if not lease_live:
-        return True
+        return True  # expired/stale -> worker claim lapsed
 
     given = getattr(args, "run_id", None)
     if given and given == lease.get("run_id"):
@@ -944,18 +971,26 @@ def _owned_cm_fail(args, research, label, exit_code):
 def _locked_append(args, fname: str, node: dict, label: str) -> int:
     """Append `node` to `.research/<fname>` with ATOMIC ownership+append under one lock.
 
-    If `node` has a placeholder "id": null and `mint` is implied, the caller should use
-    _mint_and_append_locked instead. This variant is for nodes with a fixed id."""
+    If `node` carries an explicit id (id or clue_id), it is checked for uniqueness
+    INSIDE the lock so duplicate explicit ids are rejected. If `id` is a placeholder
+    (None) the caller should use _mint_and_append_locked instead.
+    """
     research = Path(args.dir).expanduser().resolve() / ".research"
     try:
         with _owned_project_lock(args) as owned:
             if owned.exit_code:
                 return _owned_cm_fail(args, research, label, owned.exit_code)
+            # Uniqueness check for explicit ids (type-aware key).
+            explicit = node.get("id") or node.get("clue_id")
+            if explicit and _node_exists(research, str(explicit)):
+                print(f"REFUSED: duplicate id {explicit} already exists in this campaign. "
+                      f"Choose a different --id or omit it to auto-mint.", file=sys.stderr)
+                return 4   # DUPLICATE_ID
             with open(research / fname, "a", encoding="utf-8") as fh:
                 fh.write(json.dumps(node) + "\n")
     except BlockingIOError:
         return _owned_cm_fail(args, research, label, 2)
-    print(f"Added {node.get('id', 'record')} to {fname} (locked)")
+    print(f"Added {node.get('id', node.get('clue_id', 'record'))} to {fname} (locked)")
     return 0
 
 

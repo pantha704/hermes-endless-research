@@ -53,49 +53,49 @@ def test_owned_lock_validates_inside_critical_section(project):
 
 
 def test_owned_lock_barrier_interleaving(project):
-    """REAL threading.Barrier race: a mutation starts, then a lease is created while it
-    is in flight; the in-lock ownership check must refuse the mutation (exit 3) if the
-    lease exists when it holds the flock, OR allow it if it won the lock first.
+    """Truly deterministic lock-ordering race test.
 
-    Uses a threading.Barrier to force the interleaving where the gate creates the lease
-    while the mutation process is already running (after it did its pre-flight work)."""
-    barrier = threading.Barrier(2)
-    result = {"rc": None}
+    Sequence (no timing races):
+      1. Parent acquires the project flock.
+      2. Parent starts the mutation SUBPROCESS — it blocks on the flock.
+      3. Parent writes a live worker lease while still holding the flock.
+      4. Parent releases the flock.
+      5. The mutation acquires the flock, runs its in-lock ownership check, MUST see the
+         live lease and refuse (exit 3).
+      6. sources.jsonl must be unchanged.
+    This proves the ownership check happens INSIDE the lock and cannot observe a
+    stale 'no lease', regardless of process scheduling."""
+    import subprocess as _sp
 
-    def gate_run():
-        barrier.wait()
-        _gate(str(project))  # create a live lease (mimic cron gate)
-
-    def mutation_run():
-        # Do some pre-lock work, then wait for the gate to (attempt to) create a lease,
-        # then run the mutation. Whatever the interleaving, the mutation's ownership
-        # check under its flock must produce a CONSISTENT result (3 if lease present,
-        # 0 if not) — and never a partial write.
-        barrier.wait()
-        rc, out, err = _cli("source", "add", project, "--url", "https://barrier.test", "--title", "b")
-        result["rc"] = rc
-
-    t1 = threading.Thread(target=gate_run)
-    t2 = threading.Thread(target=mutation_run)
-    t1.start(); t2.start(); t1.join(); t2.join()
-
-    lease_present = (project / ".research" / ".worker-lease.json").exists()
-    srcs = rp._load_jsonl(project / ".research" / "sources.jsonl")
-    if lease_present:
-        # The gate won (or co-existed): a no-run-id mutation must have refused.
-        # The mutation could have been allowed only if it locked BEFORE the lease file
-        # landed; to keep this deterministic we only assert the invariant that a live
-        # lease with no source-write is consistent: it must be rc==3 with no write,
-        # OR rc==0 with a write AND no lease. So:
-        if len(srcs) == 0:
-            assert result["rc"] == 3, f"no write but rc={result['rc']} under a live lease"
-        elif result["rc"] == 0:
-            # a write happened -> must mean the lease was NOT live at the mutation's lock
-            pass
-    # cleanup
-    l = _lease(project)
-    if l:
-        _gate("RELEASE", project, "--run-id", l["run_id"])
+    lock = rp._project_lock(project, timeout=10)
+    lock.__enter__()
+    proc = None
+    try:
+        # Step 2: launch the mutation subprocess; it blocks acquiring the flock.
+        proc = _sp.Popen(
+            [sys.executable, str(SCRIPT), "source", "add", str(project),
+             "--url", "https://barrier.test", "--title", "b", "--lock-timeout", "10"],
+            stdout=_sp.PIPE, stderr=_sp.PIPE, text=True)
+        # Step 3: write a live lease while STILL holding the flock.
+        now = time.time()
+        (project / ".research" / ".worker-lease.json").write_text(json.dumps({
+            "run_id": "RUN-liveXXX", "status": "running",
+            "heartbeat_at": now, "expires_at": now + 600}))
+        # Step 4: release the flock (inside the finally) so the mutation proceeds.
+        lock.__exit__(None, None, None)
+        lock = None
+        # Step 5/6: wait for the child; it MUST refuse (exit 3) with no write.
+        out, err = proc.communicate(timeout=30)
+        rc = proc.returncode
+        assert rc == 3, f"expected refusal (exit 3), got {rc}\n{out}\n{err}"
+        assert "REFUSED" in (out or "") + (err or "")
+        assert rp._load_jsonl(project / ".research" / "sources.jsonl") == []
+    finally:
+        if proc is not None and proc.poll() is None:
+            proc.kill()
+        if lock is not None:
+            lock.__exit__(None, None, None)
+        (project / ".research" / ".worker-lease.json").unlink(missing_ok=True)
 
 
 def test_owned_lock_serializes_concurrent_mutations(project):
@@ -173,3 +173,49 @@ def test_init_rerun_refuses_under_live_lease(project):
     rc, out, err = _cli("init", project, "--objective", "x", "--run-id", run_id)
     assert rc == 0, err
     _gate("RELEASE", project, "--run-id", run_id)
+
+
+def test_explicit_id_duplicate_rejected(project):
+    """Explicit --id that already exists must be rejected (no duplicate node ids)."""
+    rc, out, err = _cli("source", "add", project, "--url", "https://a.test", "--title", "a",
+                        "--id", "SRC-DUP")
+    assert rc == 0, err
+    # second add with the same explicit id -> refused (exit 4)
+    rc, out, err = _cli("source", "add", project, "--url", "https://b.test", "--title", "b",
+                        "--id", "SRC-DUP")
+    assert rc == 4, err
+    assert "duplicate id" in (out + err).lower()
+    srcs = rp._load_jsonl(project / ".research" / "sources.jsonl")
+    assert len(srcs) == 1, "duplicate explicit id must not be appended"
+    assert srcs[0]["id"] == "SRC-DUP"
+
+
+def test_explicit_clue_id_duplicate_rejected(project):
+    """Explicit CLUE --id duplicates must be caught (type-aware key = clue_id)."""
+    _cli("frontier", "add", project, "--description", "c1", "--id", "CLUE-0501")
+    rc, out, err = _cli("frontier", "add", project, "--description", "c2", "--id", "CLUE-0501")
+    assert rc == 4, err
+    rows = rp._load_jsonl(project / ".research" / "frontier.jsonl")
+    assert len(rows) == 1, "duplicate CLUE id must not be appended"
+
+
+def test_explicit_deadend_id_duplicate_rejected(project):
+    _cli("dead-end", "add", project, "--description", "d1", "--id", "DE-0701")
+    rc, out, err = _cli("dead-end", "add", project, "--description", "d2", "--id", "DE-0701")
+    assert rc == 4, err
+    rows = rp._load_jsonl(project / ".research" / "dead-ends.jsonl")
+    assert len(rows) == 1
+
+
+def test_corrupt_lease_fails_closed(project):
+    """A present-but-unreadable lease must refuse mutations (fail closed)."""
+    (project / ".research" / ".worker-lease.json").write_text("{ NOT VALID JSON !!")
+    rc, out, err = _cli("source", "add", project, "--url", "https://x.test", "--title", "x")
+    assert rc == 3, err
+    assert "REFUSED" in (out + err)
+    assert rp._load_jsonl(project / ".research" / "sources.jsonl") == []
+    # operator-override is the deliberate escape hatch
+    rc, out, err = _cli("source", "add", project, "--url", "https://x.test", "--title", "x",
+                        "--operator-override")
+    assert rc == 0, err
+    (project / ".research" / ".worker-lease.json").unlink(missing_ok=True)

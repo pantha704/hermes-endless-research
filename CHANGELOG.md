@@ -6,6 +6,30 @@ adheres to [Semantic Versioning](https://semver.org/) (with `v0.x` pre-1.0 seman
 
 ## [Unreleased]
 
+## [0.2.9] — 2026-08-06
+### Fixed (crash-consistency + uniqueness + deterministic barrier)
+The audit found explicit `--id` could still duplicate, a corrupt lease failed open, init's
+HERMES.md write was a separate (ungated) lock, and the barrier test still was not
+deterministic. All closed:
+
+- **Explicit-ID uniqueness.** `_locked_append` now checks, inside the owned lock, that an
+  explicitly-supplied id does not already exist (type-aware key for CLUE/DE). Duplicate
+  `--id` is rejected with exit **4** (DUPLICATE_ID); automatic minting is unchanged.
+- **Crash-consistent lease writes.** `campaign-lease-gate.py` writes `.worker-lease.json`
+  via a temp file + `os.replace`, so a mid-write crash cannot leave a truncated lease.
+- **Corrupt-lease fail-closed.** `_check_lease_owner` distinguishes "lease absent"
+  (allow manual) from "lease present but unreadable" (REFUSE unless `--operator-override`).
+  A truncated lease can no longer let an unowned mutation through.
+- **Atomic init.** HERMES.md is now written inside the SAME owned critical section as the
+  `.research/` scaffold, closing the window where a gate could acquire a lease between the
+  two sections.
+- **Deterministic lock-ordering barrier test.** `test_owned_lock_barrier_interleaving` now
+  holds the flock in the parent, launches the mutation subprocess (blocks on the lock),
+  writes a live lease, releases, and asserts the mutation refuses (exit 3) with no write —
+  no timing races, no dual-outcome branch.
+- **Tests:** duplicate-id (SRC/CLUE/DE), corrupt-lease fail-closed + override, lease
+  crash-consistency. Suite: 101 → **106**, all green (incl. Python 3.9 parse check).
+
 ## [0.2.8] — 2026-08-06
 ### Fixed (CLUE/DE identifier schema + graph-integrity + honest barrier test)
 The audit found frontier/dead-end records store their id under `clue_id` (not `id`);

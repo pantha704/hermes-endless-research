@@ -40,6 +40,7 @@ Lease record .worker-lease.json: {run_id, status, heartbeat_at, expires_at, star
 TTL expiry, not process liveness.)
 """
 import json
+import os
 import secrets
 import sys
 import time
@@ -100,8 +101,16 @@ def _read_lease(research: Path):
 
 
 def _write_lease(research: Path, lease: dict):
+    """Write the lease CRASH-CONSISTENTLY: temp file + os.replace.
+
+    A concurrent crash mid-write cannot leave a truncated .worker-lease.json, so the
+    fail-closed reader never sees a corrupt-but-present lease.
+    """
     (research).mkdir(parents=True, exist_ok=True)
-    (research / ".worker-lease.json").write_text(json.dumps(lease))
+    dest = research / ".worker-lease.json"
+    tmp = research / ".worker-lease.json.tmp"
+    tmp.write_text(json.dumps(lease))
+    os.replace(tmp, dest)
 
 
 def _delete_lease(research: Path):

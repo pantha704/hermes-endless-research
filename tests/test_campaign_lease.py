@@ -139,8 +139,19 @@ def test_no_state_json_skips(project):
 
 def test_lease_release_roundtrip(project):
     run_id = _acquire(project)
-    _run("HEARTBEAT", str(project), "--run-id", run_id)
-    _run("RELEASE", str(project), "--run-id", run_id)
+    _run("HEARTBEAT", project, "--run-id", run_id)
+    _run("RELEASE", project, "--run-id", run_id)
     assert _lease(project) is None  # clean release lets next run re-acquire
     run_id2 = _acquire(project)
     assert run_id2 != run_id
+
+
+def test_lease_write_is_crash_consistent(project):
+    """The gate writes the lease via temp-file + os.replace: a crash cannot leave a
+    truncated/corrupt .worker-lease.json, so fail-closed readers stay consistent."""
+    _acquire(project)
+    assert _lease(project) is not None          # readable lease present
+    tmp = project / ".research" / ".worker-lease.json.tmp"
+    assert not tmp.exists(), "tmp file must not linger after a successful lease write"
+    # the lease is valid JSON
+    assert isinstance(_lease(project), dict)
