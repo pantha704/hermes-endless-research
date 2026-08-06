@@ -6,6 +6,22 @@ adheres to [Semantic Versioning](https://semver.org/) (with `v0.x` pre-1.0 seman
 
 ## [Unreleased]
 
+## [0.2.14] — 2026-08-06
+### Fixed (audit journal: fail-closed on corruption, locked audit, strict metadata)
+- **Lifecycle commands fail closed on a corrupt journal.** `run start` / `run finish` /
+  `run abort` now refuse (exit **8**) if `run-history.jsonl` has any unparseable line,
+  instead of proceeding on incomplete history (a damaged line could conceal an earlier
+  start/terminal event). They require deliberate repair/removal before any mutation.
+- **`run audit` takes the project lock** for a consistent snapshot, so a concurrent append
+  cannot expose a partial final line and trigger a transient false-corruption report.
+- **Strict metadata matching.** When the `started` event recorded a non-empty session or
+  cron job id, the terminal event must supply a matching one — an empty/missing value is a
+  mismatch (session → exit 5, cron → exit 6), not silently allowed. The normal cron path
+  (Hermes supplies `$HERMES_SESSION_ID`; the prompt supplies `--cron-job-id`) is correct.
+- **Tests:** new `test_v214_audit_failclosed.py` (5): start/finish fail-closed on a corrupt
+  journal, strict session/cron match (empty terminal value refused), locked clean-chain
+  audit. Suite: 140 → **145**, all green (incl. 3.9).
+
 ## [0.2.13] — 2026-08-06
 ### Fixed (audit journal: atomicity, strict state machine, packaging)
 The audit found six gaps in the v0.2.12 audit subsystem. All closed:

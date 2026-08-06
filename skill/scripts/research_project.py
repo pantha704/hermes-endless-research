@@ -540,20 +540,24 @@ def _terminal_for_run(events, run_id: str):
 def _check_match(ev, run_id, session_id, cron_job_id, label) -> int:
     """Validate a finish/abort against its start event. Returns 0 to proceed, else refusal
     code (4 = no/invalid start, 5 = session mismatch, 6 = cron mismatch, 7 = already
-    terminal)."""
+    terminal). STRICT: when the start event recorded a non-empty session/cron id, the
+    terminal event must supply a matching one (an empty/missing supplied value is treated
+    as a mismatch, not silently allowed)."""
     start = _start_for_run(ev, run_id)
     if start is None:
         print(f"REFUSED: {label}: no 'started' event for run {run_id}. "
               f"Call `run start` first.", file=sys.stderr)
         return 4
-    if session_id and start.get("hermes_session_id") and session_id != start.get("hermes_session_id"):
+    stored_sess = start.get("hermes_session_id")
+    if stored_sess and session_id != stored_sess:
         print(f"REFUSED: {label}: session mismatch for run {run_id}. "
-              f"start session={start.get('hermes_session_id')} vs {session_id}.",
+              f"start session={stored_sess} vs provided {session_id or '(none)'}.",
               file=sys.stderr)
         return 5
-    if cron_job_id and start.get("cron_job_id") and cron_job_id != start.get("cron_job_id"):
+    stored_cron = start.get("cron_job_id")
+    if stored_cron and cron_job_id != stored_cron:
         print(f"REFUSED: {label}: cron job mismatch for run {run_id}. "
-              f"start cron={start.get('cron_job_id')} vs {cron_job_id}.",
+              f"start cron={stored_cron} vs provided {cron_job_id or '(none)'}.",
               file=sys.stderr)
         return 6
     terms = _terminal_for_run(ev, run_id)
@@ -575,7 +579,12 @@ def cmd_run_start(args) -> int:
         with _owned_project_lock(args) as owned:
             if owned.exit_code:
                 return _owned_cm_fail(args, research, "run start", owned.exit_code)
-            events, _corrupt = _load_history_strict(research)
+            events, corrupt_lines = _load_history_strict(research)
+            if corrupt_lines:
+                print(f"REFUSED: run start: run-history.jsonl has corrupt line(s) "
+                      f"{corrupt_lines}. Refusing to mutate an incomplete journal — repair "
+                      f"or remove it deliberately first.", file=sys.stderr)
+                return 8
             # A live, un-finished run for the same campaign_run_id must not be double-started.
             if _start_for_run(events, args.run_id) is not None:
                 print(f"REFUSED: run {args.run_id} already started.", file=sys.stderr)
@@ -608,7 +617,12 @@ def cmd_run_finish(args) -> int:
         with _owned_project_lock(args) as owned:
             if owned.exit_code:
                 return _owned_cm_fail(args, research, "run finish", owned.exit_code)
-            events, _corrupt = _load_history_strict(research)
+            events, corrupt_lines = _load_history_strict(research)
+            if corrupt_lines:
+                print(f"REFUSED: run finish: run-history.jsonl has corrupt line(s) "
+                      f"{corrupt_lines}. Refusing to mutate an incomplete journal — repair "
+                      f"or remove it deliberately first.", file=sys.stderr)
+                return 8
             rc = _check_match(events, args.run_id, session_id, args.cron_job_id, "run finish")
             if rc:
                 return rc
@@ -645,7 +659,12 @@ def cmd_run_abort(args) -> int:
         with _owned_project_lock(args) as owned:
             if owned.exit_code:
                 return _owned_cm_fail(args, research, "run abort", owned.exit_code)
-            events, _corrupt = _load_history_strict(research)
+            events, corrupt_lines = _load_history_strict(research)
+            if corrupt_lines:
+                print(f"REFUSED: run abort: run-history.jsonl has corrupt line(s) "
+                      f"{corrupt_lines}. Refusing to mutate an incomplete journal — repair "
+                      f"or remove it deliberately first.", file=sys.stderr)
+                return 8
             rc = _check_match(events, args.run_id, session_id, args.cron_job_id, "run abort")
             if rc:
                 return rc
@@ -666,30 +685,36 @@ def cmd_run_abort(args) -> int:
 
 
 def cmd_run_audit(args) -> int:
-    """Reconcile the run-history journal: crashed/duplicate runs, corrupt lines, linkage."""
+    """Reconcile the run-history journal under the project lock (consistent snapshot)."""
     research = Path(args.dir).expanduser().resolve() / ".research"
-    events, corrupt_lines = _load_history_strict(research)
-    started = [e for e in events if e.get("event") == "started"]
-    # All terminal events per run, including both-type (completed AND aborted).
-    run_ids = sorted({e.get("campaign_run_id") for e in started if e.get("campaign_run_id")})
-    crashed = []
-    dup_terminal = []
-    for rid in run_ids:
-        terms = _terminal_for_run(events, rid)
-        if not terms:
-            crashed.append(rid)
-        elif len(terms) > 1:
-            dup_terminal.append(rid)
-    summary = {
-        "runs_started": len(started),
-        "runs_completed": sum(1 for e in events if e.get("event") == "completed"),
-        "runs_aborted": sum(1 for e in events if e.get("event") == "aborted"),
-        "crashed_start_only": crashed,
-        "duplicate_terminal_events": sorted(set(dup_terminal)),
-        "corrupt_history_lines": corrupt_lines,
-        "journal_integrity": "failed" if corrupt_lines else "ok",
-        "events_total": len(events),
-    }
+    if not (research / "state.json").exists():
+        print("No state.json. Run `init` first.", file=sys.stderr)
+        return 1
+    # Take the ordinary project lock so a concurrent append cannot expose a partial line
+    # and produce a transient false-corruption report.
+    proj = Path(args.dir).expanduser().resolve()
+    with _project_lock(proj, timeout=max(1.0, float(getattr(args, "lock_timeout", 10)))):
+        events, corrupt_lines = _load_history_strict(research)
+        started = [e for e in events if e.get("event") == "started"]
+        run_ids = sorted({e.get("campaign_run_id") for e in started if e.get("campaign_run_id")})
+        crashed = []
+        dup_terminal = []
+        for rid in run_ids:
+            terms = _terminal_for_run(events, rid)
+            if not terms:
+                crashed.append(rid)
+            elif len(terms) > 1:
+                dup_terminal.append(rid)
+        summary = {
+            "runs_started": len(started),
+            "runs_completed": sum(1 for e in events if e.get("event") == "completed"),
+            "runs_aborted": sum(1 for e in events if e.get("event") == "aborted"),
+            "crashed_start_only": crashed,
+            "duplicate_terminal_events": sorted(set(dup_terminal)),
+            "corrupt_history_lines": corrupt_lines,
+            "journal_integrity": "failed" if corrupt_lines else "ok",
+            "events_total": len(events),
+        }
     if getattr(args, "json", False):
         print(json.dumps(summary, indent=2))
     else:
