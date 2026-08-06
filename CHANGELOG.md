@@ -6,6 +6,32 @@ adheres to [Semantic Versioning](https://semver.org/) (with `v0.x` pre-1.0 seman
 
 ## [Unreleased]
 
+## [0.2.13] — 2026-08-06
+### Fixed (audit journal: atomicity, strict state machine, packaging)
+The audit found six gaps in the v0.2.12 audit subsystem. All closed:
+
+- **Atomic duplicate-start.** `run start` now reads the journal and validates the lifecycle
+  state INSIDE `_owned_project_lock` (read → validate → append under one lock), closing the
+  two-concurrent-start race. The broken `not ev.get("terminal")` check was replaced with a
+  real search for an existing `started` event.
+- **`--session-id` override precedence.** Now `args.session_id or _hermes_session_id()`
+  (explicit argument wins over the env var), per documented behavior.
+- **Strict start→terminal state machine.** `run finish`/`run abort` refuse when: there is no
+  matching `started` event (exit 4), the session id mismatches (exit 5), the cron job id
+  mismatches (exit 6), or the run already has a terminal event (exit 7). `run audit` flags a
+  run with BOTH completed and aborted as a duplicate terminal, not just same-type dupes.
+- **Checkpoint cron-job linkage.** `checkpoint` parser gained `--cron-job-id`, so checkpoints
+  embed the cron job id (previously blank).
+- **Corrupt-journal detection.** `run audit` now reports `corrupt_history_lines` and
+  `journal_integrity: "failed"` rather than silently discarding unparseable lines. Audit
+  appends are fsynced (temp-safe crash durability, like the lease writer).
+- **Packaged cron prompt updated.** `templates/research-cron-prompt.md` now implements the
+  full audit lifecycle (`run start` → research → `checkpoint --cron-job-id` → `run finish`
+  → release); a fresh install now uses the journal automatically.
+- **Tests:** new `test_v213_audit_state.py` (8): no-start/session/cron/already-terminal
+  refusals, completed+aborted duplicate detection, `--session-id` override, corrupt-line
+  reporting, checkpoint cron-job id. Suite: 132 → **140**, all green (incl. 3.9).
+
 ## [0.2.12] — 2026-08-06
 ### Added (per-run audit journal — run-history.jsonl + `run` CLI)
 - **Append-only audit journal** `.research/run-history.jsonl`. `run start` / `run finish` /

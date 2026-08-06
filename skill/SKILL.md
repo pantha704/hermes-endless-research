@@ -1,7 +1,7 @@
 ---
 name: endless-research
 description: Use when research must dig until it is found.
-version: 0.2.12
+version: 0.2.13
 author: Hermes Agent
 license: MIT
 metadata:

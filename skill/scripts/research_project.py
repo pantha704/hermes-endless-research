@@ -500,48 +500,91 @@ def _history_path(research: Path) -> Path:
 
 
 def _append_history_event(research: Path, event: dict) -> None:
-    with open(_history_path(research), "a", encoding="utf-8") as fh:
+    """Append one audit event, fsynced for crash-durability (like the lease writer)."""
+    p = _history_path(research)
+    with open(p, "a", encoding="utf-8") as fh:
         fh.write(json.dumps(event) + "\n")
+        fh.flush()
+        os.fsync(fh.fileno())
 
 
-def _load_history(research: Path):
+def _load_history_strict(research: Path):
+    """Load run-history rows, tracking any unparseable line numbers.
+    Returns (rows, corrupt_line_numbers).
+    """
     rows = []
-    if _history_path(research).exists():
-        for line in _history_path(research).read_text().splitlines():
+    corrupt = []
+    p = _history_path(research)
+    if p.exists():
+        for idx, line in enumerate(p.read_text().splitlines(), start=1):
             line = line.strip()
             if not line:
                 continue
             try:
                 rows.append(json.loads(line))
             except json.JSONDecodeError:
-                continue
-    return rows
+                corrupt.append(idx)
+    return rows, corrupt
+
+
+def _start_for_run(events, run_id: str):
+    return next((e for e in events if e.get("event") == "started"
+                 and e.get("campaign_run_id") == run_id), None)
+
+
+def _terminal_for_run(events, run_id: str):
+    return [e for e in events if e.get("event") in ("completed", "aborted")
+            and e.get("campaign_run_id") == run_id]
+
+
+def _check_match(ev, run_id, session_id, cron_job_id, label) -> int:
+    """Validate a finish/abort against its start event. Returns 0 to proceed, else refusal
+    code (4 = no/invalid start, 5 = session mismatch, 6 = cron mismatch, 7 = already
+    terminal)."""
+    start = _start_for_run(ev, run_id)
+    if start is None:
+        print(f"REFUSED: {label}: no 'started' event for run {run_id}. "
+              f"Call `run start` first.", file=sys.stderr)
+        return 4
+    if session_id and start.get("hermes_session_id") and session_id != start.get("hermes_session_id"):
+        print(f"REFUSED: {label}: session mismatch for run {run_id}. "
+              f"start session={start.get('hermes_session_id')} vs {session_id}.",
+              file=sys.stderr)
+        return 5
+    if cron_job_id and start.get("cron_job_id") and cron_job_id != start.get("cron_job_id"):
+        print(f"REFUSED: {label}: cron job mismatch for run {run_id}. "
+              f"start cron={start.get('cron_job_id')} vs {cron_job_id}.",
+              file=sys.stderr)
+        return 6
+    terms = _terminal_for_run(ev, run_id)
+    if terms:
+        print(f"REFUSED: {label}: run {run_id} already has terminal event "
+              f"({terms[0].get('event')}).", file=sys.stderr)
+        return 7
+    return 0
 
 
 def cmd_run_start(args) -> int:
-    """Record a 'started' audit event for this research run (append-only, locked)."""
+    """Record a 'started' audit event (ATOMIC: read+validate+append under one lock)."""
     research = Path(args.dir).expanduser().resolve() / ".research"
     if not (research / "state.json").exists():
         print("No state.json. Run `init` first.", file=sys.stderr)
         return 1
-    events = _load_history(research)
-    # A live, un-finished run for the same campaign_run_id must not be double-started.
-    for ev in events:
-        if (ev.get("event") == "started"
-                and ev.get("campaign_run_id") == args.run_id
-                and not ev.get("terminal")):
-            print(f"REFUSED: run {args.run_id} already started with no terminal event.",
-                  file=sys.stderr)
-            return 4
+    session_id = args.session_id or _hermes_session_id() or ""
     try:
         with _owned_project_lock(args) as owned:
             if owned.exit_code:
                 return _owned_cm_fail(args, research, "run start", owned.exit_code)
+            events, _corrupt = _load_history_strict(research)
+            # A live, un-finished run for the same campaign_run_id must not be double-started.
+            if _start_for_run(events, args.run_id) is not None:
+                print(f"REFUSED: run {args.run_id} already started.", file=sys.stderr)
+                return 4
             event = {
                 "schema_version": AUDIT_SCHEMA,
                 "event": "started",
                 "campaign_run_id": args.run_id,
-                "hermes_session_id": _hermes_session_id() or args.session_id or "",
+                "hermes_session_id": session_id,
                 "cron_job_id": args.cron_job_id or "",
                 "timestamp": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
                 "state": getattr(args, "state", ""),
@@ -555,20 +598,25 @@ def cmd_run_start(args) -> int:
 
 
 def cmd_run_finish(args) -> int:
-    """Record a 'completed' audit event closing a 'started' event (append-only, locked)."""
+    """Record a 'completed' terminal event (strict start->terminal state machine, atomic)."""
     research = Path(args.dir).expanduser().resolve() / ".research"
     if not (research / "state.json").exists():
         print("No state.json. Run `init` first.", file=sys.stderr)
         return 1
+    session_id = args.session_id or _hermes_session_id() or ""
     try:
         with _owned_project_lock(args) as owned:
             if owned.exit_code:
                 return _owned_cm_fail(args, research, "run finish", owned.exit_code)
+            events, _corrupt = _load_history_strict(research)
+            rc = _check_match(events, args.run_id, session_id, args.cron_job_id, "run finish")
+            if rc:
+                return rc
             event = {
                 "schema_version": AUDIT_SCHEMA,
                 "event": "completed",
                 "campaign_run_id": args.run_id,
-                "hermes_session_id": _hermes_session_id() or args.session_id or "",
+                "hermes_session_id": session_id,
                 "cron_job_id": args.cron_job_id or "",
                 "timestamp": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
                 "checkpoint": args.checkpoint or "",
@@ -587,20 +635,25 @@ def cmd_run_finish(args) -> int:
 
 
 def cmd_run_abort(args) -> int:
-    """Record an intentional 'aborted' terminal event (append-only, locked)."""
+    """Record an intentional 'aborted' terminal event (strict state machine, atomic)."""
     research = Path(args.dir).expanduser().resolve() / ".research"
     if not (research / "state.json").exists():
         print("No state.json. Run `init` first.", file=sys.stderr)
         return 1
+    session_id = args.session_id or _hermes_session_id() or ""
     try:
         with _owned_project_lock(args) as owned:
             if owned.exit_code:
                 return _owned_cm_fail(args, research, "run abort", owned.exit_code)
+            events, _corrupt = _load_history_strict(research)
+            rc = _check_match(events, args.run_id, session_id, args.cron_job_id, "run abort")
+            if rc:
+                return rc
             event = {
                 "schema_version": AUDIT_SCHEMA,
                 "event": "aborted",
                 "campaign_run_id": args.run_id,
-                "hermes_session_id": _hermes_session_id() or args.session_id or "",
+                "hermes_session_id": session_id,
                 "cron_job_id": args.cron_job_id or "",
                 "timestamp": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
                 "reason": args.reason or "",
@@ -613,28 +666,28 @@ def cmd_run_abort(args) -> int:
 
 
 def cmd_run_audit(args) -> int:
-    """Reconcile the run-history journal: crashed runs, dupes, linkage gaps."""
+    """Reconcile the run-history journal: crashed/duplicate runs, corrupt lines, linkage."""
     research = Path(args.dir).expanduser().resolve() / ".research"
-    events = _load_history(research)
+    events, corrupt_lines = _load_history_strict(research)
     started = [e for e in events if e.get("event") == "started"]
-    terminal_events = [e for e in events if e.get("event") in ("completed", "aborted")]
-    # Group started runs and find those with no terminal event (crashed).
+    # All terminal events per run, including both-type (completed AND aborted).
     run_ids = sorted({e.get("campaign_run_id") for e in started if e.get("campaign_run_id")})
     crashed = []
+    dup_terminal = []
     for rid in run_ids:
-        if not any(e.get("event") in ("completed", "aborted") and e.get("campaign_run_id") == rid
-                   for e in events):
+        terms = _terminal_for_run(events, rid)
+        if not terms:
             crashed.append(rid)
-    dup_finish = [e.get("campaign_run_id") for e in terminal_events
-                  if e.get("campaign_run_id") and
-                  sum(1 for x in events if x.get("event") == e.get("event")
-                      and x.get("campaign_run_id") == e.get("campaign_run_id")) > 1]
+        elif len(terms) > 1:
+            dup_terminal.append(rid)
     summary = {
         "runs_started": len(started),
         "runs_completed": sum(1 for e in events if e.get("event") == "completed"),
         "runs_aborted": sum(1 for e in events if e.get("event") == "aborted"),
         "crashed_start_only": crashed,
-        "duplicate_terminal_events": sorted(set(dup_finish)),
+        "duplicate_terminal_events": sorted(set(dup_terminal)),
+        "corrupt_history_lines": corrupt_lines,
+        "journal_integrity": "failed" if corrupt_lines else "ok",
         "events_total": len(events),
     }
     if getattr(args, "json", False):
@@ -645,6 +698,8 @@ def cmd_run_audit(args) -> int:
             print(f"  {k}: {v}")
         if crashed:
             print("  WARNING: start-only (crashed) runs →", crashed)
+        if corrupt_lines:
+            print("  WARNING: corrupt journal lines →", corrupt_lines)
     return 0
 
 
@@ -1973,6 +2028,7 @@ def main(argv=None) -> int:
     pc.add_argument("--note", default=None)
     pc.add_argument("--lock-timeout", dest="lock_timeout", type=float, default=10)
     pc.add_argument("--run-id", default=None, help="prove ownership of the active worker lease")
+    pc.add_argument("--cron-job-id", default=None, help="cron job id to embed in the checkpoint")
     pc.add_argument("--operator-override", action="store_true", help="force a manual write despite a live lease (emergency)")
     pc.set_defaults(fn=cmd_checkpoint)
 

@@ -49,7 +49,11 @@ CONCURRENCY — DESIGN 2 (lock every shared-state write):
     python3 RPT contradiction resolve <PROJECT> <XID> --note "how resolved" --run-id <RUN_ID>
     python3 RPT report        write <PROJECT> --content "# Final Report\n..." --run-id <RUN_ID>
     python3 RPT resignal      <PROJECT> <STATE> [--note "..."] [--cron <RESEARCH_JOB_ID>] --run-id <RUN_ID>
-    python3 RPT checkpoint    <PROJECT> [--note "..."] --run-id <RUN_ID>
+    python3 RPT checkpoint    <PROJECT> [--note "..."] [--cron-job-id <RESEARCH_JOB_ID>] --run-id <RUN_ID>
+    python3 RPT run           start <PROJECT> --run-id <RUN_ID> --cron-job-id <RESEARCH_JOB_ID>
+    python3 RPT run           finish <PROJECT> --run-id <RUN_ID> --cron-job-id <RESEARCH_JOB_ID> --checkpoint <CP> [--state <STATE>] [--sources N]
+    python3 RPT run           abort <PROJECT> --run-id <RUN_ID> --cron-job-id <RESEARCH_JOB_ID> --reason "..."
+    python3 RPT run           audit <PROJECT> [--json]
   If a locked command exits code 2, the project is locked by a prior run: skip that
   write. If it exits code 3, you do not own the lease: you are a duplicate — STOP.
 
@@ -79,9 +83,21 @@ record any contradiction with `contradiction add` (and resolve with `contradicti
 when warranted), leave state as CONTINUE (or BLOCKED/DORMANT/EXHAUSTED only if genuinely
 appropriate) via `resignal <PROJECT> <STATE> --note "..." --cron <RESEARCH_JOB_ID>`.
 
-STEP 5 — Ensure at least one `checkpoint <PROJECT> --note "<what this tick did>"` runs
-(this also authenticates the round), then RELEASE your worker lease (STRICT ownership —
-only your exact run id clears it; there is NO anonymous release):
+STEP 0 — AUDIT LIFECYCLE (v0.2.12+): record your run in the per-run journal.
+The final checkpoint and lease release below close the chain. Concretely:
+  1. FIRST, after the gate hands you RUN_ID, record the start (auto-captures
+     HERMES_SESSION_ID):
+       python3 RPT run start <PROJECT> --run-id <RUN_ID> --cron-job-id <RESEARCH_JOB_ID>
+  2. Before RELEASE, record completion with real deltas:
+       python3 RPT run finish <PROJECT> --run-id <RUN_ID> --cron-job-id <RESEARCH_JOB_ID>
+           --checkpoint <checkpoint-path> --state <STATE>
+           [--sources N] [--claims N] [--edges N] [--next-clue CLUE-xxxx]
+     (On an intentional early stop use `run abort --reason ...` instead.)
+
+STEP 5 — Ensure at least one `checkpoint <PROJECT> --note <what this tick did> --cron-job-id <RESEARCH_JOB_ID>`
+runs (this also embeds run/session/cron ids and authenticates the round). Then `run finish`
+(as in STEP 0) and RELEASE your worker lease (STRICT ownership — only your exact run id
+clears it; there is NO anonymous release):
     python3 ~/.hermes/scripts/campaign-lease-gate.py RELEASE <PROJECT> --run-id <RUN_ID>
 (If you never captured RUN_ID, use `... campaign-lease-gate.py STATUS <PROJECT>` to read
 the current lease's run_id — but only release it if it is genuinely yours.)
