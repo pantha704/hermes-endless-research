@@ -72,14 +72,20 @@ def test_double_terminal_refused(project):
 def test_audit_flags_completed_plus_aborted_as_duplicate(project):
     """One completed AND one aborted for the same run = 2 terminal events => flagged."""
     rid = _acquire(project)
-    _cli("run", "start", project, "--run-id", rid, "--cron-job-id", "JOB")
-    _cli("run", "finish", project, "--run-id", rid, "--cron-job-id", "JOB")
-    # Force a terminal anomaly by appending a second terminal event directly (simulate an
-    # older journal that predates the strict state machine).
+    _cli("run", "start", project, "--run-id", rid, "--cron-job-id", "JOB",
+         env_mult={"HERMES_SESSION_ID": "S"})
+    _cli("run", "finish", project, "--run-id", rid, "--cron-job-id", "JOB",
+         env_mult={"HERMES_SESSION_ID": "S"})
+    # Append a SCHEMA-VALID aborted event (simulates a journal that predates the strict
+    # state machine) so it is counted as a second terminal event, not as corruption.
     with open(project / ".research" / "run-history.jsonl", "a") as fh:
-        fh.write(json.dumps({"event": "aborted", "campaign_run_id": rid}) + "\n")
+        fh.write(json.dumps({
+            "schema_version": 1, "event": "aborted", "campaign_run_id": rid,
+            "hermes_session_id": "S", "cron_job_id": "JOB",
+            "timestamp": "2026-08-06T00:00:00Z", "reason": "x"}) + "\n")
     rc, out, err = _cli("run", "audit", project, "--json")
     d = json.loads(out)
+    assert d["journal_integrity"] == "ok", d
     assert rid in d["duplicate_terminal_events"], d
 
 

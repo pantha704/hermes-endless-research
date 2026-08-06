@@ -6,6 +6,25 @@ adheres to [Semantic Versioning](https://semver.org/) (with `v0.x` pre-1.0 seman
 
 ## [Unreleased]
 
+## [0.2.15] — 2026-08-06
+### Fixed (semantic audit-event schema validation — mirrors the v0.2.11 lease validator)
+- **`_history_event_schema_ok()`** validates each parsed journal row is a well-formed
+  audit event before it is trusted (analogous to `_lease_schema_ok`): must be a dict,
+  `schema_version` == AUDIT_SCHEMA, `event` ∈ {started, completed, aborted}, `campaign_run_id`
+  a string with `RUN-` prefix, `timestamp` a non-empty string, plus typed per-event fields
+  (sources/claims/edges ints, checkpoint/reason/session/cron strings, started
+  rounds_completed int-or-null). `_load_history_strict` now classifies any row failing this
+  schema as **corrupt** (line recorded, skipped) rather than parsing a `null`, `[]`, or
+  field-missing object that would later crash on `.get()` or be silently mis-linked.
+- **Fail-closed is now semantic, not just syntactic**: `null`, `[]`, wrong schema_version,
+  unknown event, missing `campaign_run_id`, and bad field types all block `run start` /
+  `run finish` / `run abort` (exit **8**) and are reported in `corrupt_history_lines` /
+  `journal_integrity`.
+- **Tests:** new `test_v215_audit_schema.py` (5): schema valid/reject units, non-object rows
+  reported as corrupt, run-start fail-closed on semantic corruption, and a dedicated
+  `run abort` corrupt-journal refusal (the v0.2.14 test gap). One v0.2.13 duplicate-terminal
+  test updated to append a schema-valid aborted row. Suite: 145 → **150**, all green (incl. 3.9).
+
 ## [0.2.14] — 2026-08-06
 ### Fixed (audit journal: fail-closed on corruption, locked audit, strict metadata)
 - **Lifecycle commands fail closed on a corrupt journal.** `run start` / `run finish` /

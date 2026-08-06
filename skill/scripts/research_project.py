@@ -508,8 +508,50 @@ def _append_history_event(research: Path, event: dict) -> None:
         os.fsync(fh.fileno())
 
 
+def _history_event_schema_ok(event: object) -> bool:
+    """Semantic schema validation for a parsed audit-event row (mirrors the lease
+    validator in _lease_schema_ok).
+
+    A syntactically-valid JSON token that is not a well-formed audit event is treated as
+    corrupt (fail-closed) — it must NOT be silently parsed (which could crash on .get())
+    nor accepted as a valid event.
+    """
+    if not isinstance(event, dict):
+        return False                        # null / [] / scalar -> corrupt
+    if event.get("schema_version") != AUDIT_SCHEMA:
+        return False
+    if event.get("event") not in ("started", "completed", "aborted"):
+        return False
+    run_id = event.get("campaign_run_id")
+    if not isinstance(run_id, str) or not run_id.startswith("RUN-"):
+        return False
+    if not isinstance(event.get("timestamp"), str) or not event["timestamp"]:
+        return False
+    # Event-specific required/typed fields.
+    sess = event.get("hermes_session_id")
+    if sess is not None and not isinstance(sess, str):
+        return False
+    cron = event.get("cron_job_id")
+    if cron is not None and not isinstance(cron, str):
+        return False
+    ev = event.get("event")
+    if ev == "started":
+        if not isinstance(event.get("rounds_completed"), (int, type(None))):
+            return False
+    elif ev == "completed":
+        if event.get("checkpoint") is not None and not isinstance(event.get("checkpoint"), str):
+            return False
+        for intf in ("sources_added", "claims_added", "edges_added"):
+            if not isinstance(event.get(intf, 0), int) or isinstance(event.get(intf, 0), bool):
+                return False
+    elif ev == "aborted":
+        if event.get("reason") is not None and not isinstance(event.get("reason"), str):
+            return False
+    return True
+
+
 def _load_history_strict(research: Path):
-    """Load run-history rows, tracking any unparseable line numbers.
+    """Load run-history rows, tracking any unparseable OR schema-invalid line numbers.
     Returns (rows, corrupt_line_numbers).
     """
     rows = []
@@ -521,9 +563,15 @@ def _load_history_strict(research: Path):
             if not line:
                 continue
             try:
-                rows.append(json.loads(line))
+                obj = json.loads(line)
             except json.JSONDecodeError:
                 corrupt.append(idx)
+                continue
+            # Semantic validation: a valid-JSON-but-malformed event is also corrupt.
+            if not _history_event_schema_ok(obj):
+                corrupt.append(idx)
+                continue
+            rows.append(obj)
     return rows, corrupt
 
 
