@@ -888,14 +888,48 @@ def cmd_edge(args) -> int:
 # serialized by the project lock. This is the crash-resistant design: a state-changing
 # operation is a single locked CLI call.
 
+def _lease_schema_ok(lease) -> bool:
+    """Semantic schema validation for a worker lease object.
+
+    Returns True only if the object is a well-formed lease. A syntactically-valid JSON
+    object that FAILS this schema is treated as corrupt (fail-closed) — it must NOT be
+    misread as a valid-but-expired lease (which would let a new worker take over) nor
+    cause a comparison error (e.g. expiry being a string).
+
+    Required fields:
+      run_id        non-empty string
+      status        a recognized value ("running")
+      expires_at    finite numeric timestamp
+      heartbeat_at  finite numeric timestamp
+      started_at    string (validated only when present)
+    """
+    if not isinstance(lease, dict):
+        return False
+    run_id = lease.get("run_id")
+    if not isinstance(run_id, str) or not run_id.strip():
+        return False
+    if lease.get("status") not in ("running",):
+        return False
+    for key in ("expires_at", "heartbeat_at"):
+        val = lease.get(key)
+        # finite numeric timestamp (int/float, not bool, not NaN/inf, not str)
+        if isinstance(val, bool) or not isinstance(val, (int, float)):
+            return False
+        if isinstance(val, float) and (val != val or val in (float("inf"), float("-inf"))):
+            return False
+    if "started_at" in lease and not isinstance(lease.get("started_at"), str):
+        return False
+    return True
+
+
 def _read_lease_fail_closed(research: Path):
     """Read `.worker-lease.json` with FAIL-CLOSED semantics.
 
     Returns:
       (None, None)                    -> lease file absent (allow manual mutation)
-      (lease_dict, None)              -> lease readable (caller applies live/expired rules)
-      (None, "unreadable")            -> lease present but unreadable (corrupt/truncated)
-                                          -> MUST refuse (fail closed)
+      (lease_dict, None)              -> lease readable and schema-valid
+      (None, "unreadable")            -> lease present but unreadable OR schema-invalid
+                                          (corrupt / malformed) -> MUST refuse (fail closed)
     """
     p = research / ".worker-lease.json"
     if not p.exists():
@@ -904,6 +938,8 @@ def _read_lease_fail_closed(research: Path):
         lease = json.loads(p.read_text())
         if not isinstance(lease, dict):
             return None, "unreadable"
+        if not _lease_schema_ok(lease):
+            return None, "unreadable"   # syntactically valid JSON but not a valid lease
         return lease, None
     except Exception:
         return None, "unreadable"

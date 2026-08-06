@@ -6,6 +6,27 @@ adheres to [Semantic Versioning](https://semver.org/) (with `v0.x` pre-1.0 seman
 
 ## [Unreleased]
 
+## [0.2.11] — 2026-08-06
+### Fixed (semantic lease-schema validation — fail-closed on malformed-but-valid JSON)
+The audit found the fail-closed reader only caught syntactically invalid JSON. A lease
+that was valid JSON but missed required fields (e.g. `{}`, no `expires_at`) or had a bad
+type (`expires_at: "tomorrow"`) was treated as expired/invalid and a new worker could take
+over, or a comparison error could crash the check. Both the mutation layer and the gate
+had the same gap.
+
+- **`_lease_schema_ok()`** added to both `research_project.py` and `campaign-lease-gate.py`.
+  A readable lease is only trusted if: `run_id` is a non-empty string, `status` is a
+  recognized value (`running`), `expires_at` and `heartbeat_at` are finite numeric
+  timestamps (not bool/NaN/Inf/str), and `started_at` is a string when present.
+- **`_read_lease_fail_closed`** in both layers now returns `"unreadable"` (fail-closed) for
+  any object that fails the schema — so a schema-invalid lease is treated as corrupt, never
+  as a valid-but-expired lease. The gate cannot `CHECK`-takeover it, `HEARTBEAT`/`RELEASE`
+  refuse, `STATUS` reports `corrupt`, and mutations refuse (unless `--operator-override`).
+  The `expires_at: "tomorrow"` crash case is closed.
+- **Tests:** new `test_v211.py` (7): schema valid/reject units, gate fail-closed on `{}`
+  and on a str-`expires_at` lease, gate heartbeat/status on semantic leases, and mutation
+  refusal. Suite: 116 → **123**, all green (incl. Python 3.9 parse check).
+
 ## [0.2.10] — 2026-08-06
 ### Fixed (gate fail-closed corrupt lease + explicit-ID prefix/type validation)
 The audit found the cron gate still failed open on a corrupt lease, and explicit IDs were

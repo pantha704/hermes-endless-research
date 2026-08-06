@@ -93,12 +93,39 @@ def _read_state(research: Path):
         return None
 
 
+def _lease_schema_ok(lease) -> bool:
+    """Semantic schema validation (mirrors the mutation layer's `_lease_schema_ok`).
+
+    A syntactically-valid JSON object that FAILS this schema is treated as corrupt
+    (fail-closed), NOT as a valid-but-expired lease — so a new worker cannot take over an
+    unknown owner's campaign, and a malformed field (e.g. `expires_at: "tomorrow"`) cannot
+    cause a comparison error.
+    """
+    if not isinstance(lease, dict):
+        return False
+    run_id = lease.get("run_id")
+    if not isinstance(run_id, str) or not run_id.strip():
+        return False
+    if lease.get("status") not in ("running",):
+        return False
+    for key in ("expires_at", "heartbeat_at"):
+        val = lease.get(key)
+        if isinstance(val, bool) or not isinstance(val, (int, float)):
+            return False
+        if isinstance(val, float) and (val != val or val in (float("inf"), float("-inf"))):
+            return False
+    if "started_at" in lease and not isinstance(lease.get("started_at"), str):
+        return False
+    return True
+
+
 def _read_lease_fail_closed(research: Path):
     """Read the lease with FAIL-CLOSED semantics (mirrors the mutation layer).
 
-    Returns (lease_dict, None)      readable
+    Returns (lease_dict, None)      readable and schema-valid
             (None, None)            absent                 -> safe to acquire
-            (None, "unreadable")    present but corrupt    -> FAIL CLOSED
+            (None, "unreadable")    present but corrupt (syntactically invalid JSON OR
+                                    schema-invalid)        -> FAIL CLOSED
     """
     p = research / ".worker-lease.json"
     if not p.exists():
@@ -107,6 +134,8 @@ def _read_lease_fail_closed(research: Path):
         lease = json.loads(p.read_text())
         if not isinstance(lease, dict):
             return None, "unreadable"
+        if not _lease_schema_ok(lease):
+            return None, "unreadable"   # valid JSON but not a valid lease object
         return lease, None
     except Exception:
         return None, "unreadable"

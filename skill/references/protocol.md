@@ -265,7 +265,11 @@ Two independent layers stop two ticks from mutating the same project:
    (mutations) or emits `wakeAgent:false` (gate); a lease that is PRESENT but
    unreadable/corrupt REFUSES all mutations AND makes the gate produce `wakeAgent:false`
    with a recovery warning (the gate never auto-takeovers an unreadable lease — recovery
-   is an explicit `RELEASE --operator-override` admin action). The gate writes the lease
+   is an explicit `RELEASE --operator-override` admin action). "Unreadable" includes both
+   syntactically invalid JSON AND any object that fails the lease schema (`run_id` non-empty
+   string, `status` recognized, `expires_at`/`heartbeat_at` finite numeric, `started_at`
+   string when present) — a malformed-but-parseable lease is never misread as expired. The
+   gate writes the lease
    atomically (temp + `os.fsync` + `os.replace` + parent-dir fsync) so no crash can leave
    a truncated lease. Explicit `--id` must carry the correct type prefix (`SRC-`/`CLM-`/
    `CLUE-`/`DE-`/`C-`/`X-` per command) and be unique in its target file (duplicates exit
