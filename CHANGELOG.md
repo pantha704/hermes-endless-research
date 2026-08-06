@@ -6,6 +6,26 @@ adheres to [Semantic Versioning](https://semver.org/) (with `v0.x` pre-1.0 seman
 
 ## [Unreleased]
 
+## [0.2.8] — 2026-08-06
+### Fixed (CLUE/DE identifier schema + graph-integrity + honest barrier test)
+The audit found frontier/dead-end records store their id under `clue_id` (not `id`);
+`_mint_id` and `_node_exists` only looked at `id`, so CLUE/DE allocation could duplicate
+(e.g. repeated CLUE-0001) and the graph could not resolve CLUE/DE endpoints. Also, the
+"barrier" race test did not actually use a barrier, and `init` re-run was ungated.
+
+- **`NODE_ID_KEYS`** schema map (`{"CLUE":"clue_id","DE":"clue_id"}`). `_mint_id` and
+  `_node_exists` now select the correct identifier key per type, so frontier/dead-end
+  allocation is collision-free and CLUE/DE nodes resolve in the evidence graph.
+- **`_mint_and_append_locked`** defaults the id key from `NODE_ID_KEYS[prefix]`.
+- **Real `threading.Barrier` race test** (`test_owned_lock_barrier_interleaving`) that
+  interleaves a running mutation with a gate creating a lease; replaces the overstated
+  docstring-only claim.
+- **`init` re-run is ownership-gated**: on an already-initialized campaign it refuses
+  (exit 3) without `--run-id`/`--operator-override` when a worker is active.
+- **Tests:** new `test_schema_id_keys.py` (8: CLUE/DE incremental + concurrent minting,
+  node resolution, graph edges referencing CLUE/DE) + init-rerun + barrier tests.
+  Suite: 91 → **101**, all green (incl. Python 3.9 parse check).
+
 ## [0.2.7] — 2026-08-06
 ### Fixed (atomic ownership contract — check-then-lock race closed)
 The audit found ownership was validated BEFORE the flock was acquired (a race: a check

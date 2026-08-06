@@ -259,8 +259,13 @@ Two independent layers stop two ticks from mutating the same project:
    SAME cron job id) cannot: a manual run, a second cron job, another profile, or a
    separately launched script.
 
-Layer 1 is the primary overlap guard; layer 2 is belt-and-suspenders for the project's
-own state files.
+4. **Identifier schema is type-aware.** Frontier (`CLUE-*`) and dead-end (`DE-*`) records
+   store their id under `clue_id`; all other node types use `id`. `_mint_id` and
+   `_node_exists` respect `NODE_ID_KEYS = {"CLUE": "clue_id", "DE": "clue_id"}` so
+   automatic ID allocation is collision-free and CLUE/DE nodes resolve in the evidence
+   graph (no false "unknown node" / dangling-endpoint errors).
+
+Layer 1 is the primary overlap guard; layers 2-4 are belt-and-suspenders.
 
 ## Cron campaign wiring — TWO jobs (the "until the end of the world" heartbeat)
 

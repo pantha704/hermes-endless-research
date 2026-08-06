@@ -280,6 +280,13 @@ def cmd_init(args) -> int:
     failure = args.failure or "_unset_"
 
     with _project_lock(proj, timeout=max(1.0, float(getattr(args, "lock_timeout", 10)))):
+        # If the project is ALREADY initialized (state.json exists), re-running init is a
+        # mutation of an active campaign: enforce lease ownership unless an operator
+        # overrides. Fresh init (no state.json yet) proceeds normally.
+        if (research / "state.json").exists():
+            if not _check_lease_owner(args, proj, research):
+                _owned_cm_fail(args, research, "init(re-run)", 3)
+                return 3
         for name, content in TEMPLATES.items():
             target = research / name
             if target.exists():
@@ -713,9 +720,20 @@ NODE_KINDS = {
     "X": "contradictions.jsonl",  # CONTRADICTION
 }
 
+# Identifier field used by each record type. CLUE and DE records store their id under
+# "clue_id" (not "id"), so ID minting and node resolution must use this map.
+NODE_ID_KEYS = {
+    "CLUE": "clue_id",
+    "DE": "clue_id",
+}
+
 
 def _node_exists(research: Path, node_id: str) -> bool:
-    """True if node_id resolves to an existing node in the project files."""
+    """True if node_id resolves to an existing node in the project files.
+
+    Uses the correct identifier key per type (clue_id for CLUE/DE, id otherwise) so
+    frontier/dead-end records (stored under "clue_id") are resolvable by the graph.
+    """
     prefix = node_id.split("-")[0] if "-" in node_id else node_id
     fname = NODE_KINDS.get(prefix)
     if fname is None:
@@ -723,7 +741,8 @@ def _node_exists(research: Path, node_id: str) -> bool:
     p = research / fname
     if not p.exists():
         return False
-    return any(rec.get("id") == node_id for rec in _load_jsonl(p))
+    id_key = _node_id_key(prefix)
+    return any(rec.get(id_key) == node_id for rec in _load_jsonl(p))
 
 
 def _load_edges(research: Path) -> list:
@@ -941,13 +960,16 @@ def _locked_append(args, fname: str, node: dict, label: str) -> int:
 
 
 def _mint_and_append_locked(args, fname: str, prefix: str, label: str,
-                            node: dict, id_key: str = "id") -> int:
+                            node: dict, id_key: str = None) -> int:
     """Atomically mint an id AND append `node` under one flock.
 
     `node` must carry `id_key: None` (or absent). The id is computed from the current
     file contents INSIDE the lock (closing the ID-allocation race), the node is filled,
-    then appended within the same critical section (lease check + mint + append).
+    then appended within the same critical section (lease check + mint + append). The
+    identifier key defaults to NODE_ID_KEYS[prefix] (clue_id for CLUE/DE).
     """
+    if id_key is None:
+        id_key = _node_id_key(prefix)
     research = Path(args.dir).expanduser().resolve() / ".research"
     try:
         with _owned_project_lock(args) as owned:
@@ -1044,8 +1066,19 @@ class _OwnedCM:
 
 
 
+def _node_id_key(prefix: str) -> str:
+    """Return the identifier field name for a record prefix."""
+    return NODE_ID_KEYS.get(prefix, "id")
+
+
 def _mint_id(research: Path, fname: str, prefix: str) -> str:
-    existing = {n.get("id") for n in _load_jsonl(research / fname)}
+    """Mint the next free id for `prefix` records in `fname`.
+
+    Uses the correct identifier key per type (clue_id for CLUE/DE records, id otherwise)
+    so frontier/dead-end records do not collide (CLUE-0001 / DE-0001 must not duplicate).
+    """
+    id_key = _node_id_key(prefix)
+    existing = {n.get(id_key) for n in _load_jsonl(research / fname) if n.get(id_key)}
     i = 1
     while True:
         cand = f"{prefix}-{i:04d}"
@@ -1619,6 +1652,11 @@ def main(argv=None) -> int:
     pi.add_argument("--success", default=None)
     pi.add_argument("--failure", default=None)
     pi.add_argument("--now", action="store_true", help="(reserved)")
+    pi.add_argument("--lock-timeout", dest="lock_timeout", type=float, default=10)
+    pi.add_argument("--run-id", default=None,
+                    help="prove ownership when re-running init on an active campaign")
+    pi.add_argument("--operator-override", action="store_true",
+                    help="force a re-init despite a live lease (emergency)")
     pi.set_defaults(fn=cmd_init)
 
     ps = sub.add_parser("status", help="print state + priority-sorted queue")
