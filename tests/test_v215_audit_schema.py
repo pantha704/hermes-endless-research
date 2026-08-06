@@ -43,6 +43,9 @@ def test_history_event_schema_valid():
     completed = dict(VALID_START); completed["event"] = "completed"
     completed["checkpoint"] = "cp.md"; completed["sources_added"] = 1
     assert rp._history_event_schema_ok(completed) is True
+    # rounds_completed = 0 is a valid int (not a bool) and must be accepted.
+    started0 = dict(VALID_START); started0["rounds_completed"] = 0
+    assert rp._history_event_schema_ok(started0) is True
 
 
 def test_history_event_schema_rejects_malformed():
@@ -60,6 +63,8 @@ def test_history_event_schema_rejects_malformed():
          "timestamp": "t"},            # unknown event
         {"schema_version": 1, "event": "completed", "campaign_run_id": "RUN-x",
          "timestamp": "t", "sources_added": "3"},  # bad type
+        {"schema_version": 1, "event": "started", "campaign_run_id": "RUN-x",
+         "timestamp": "t", "rounds_completed": True},  # bool is not a valid integer
     ]
     for c in cases:
         assert rp._history_event_schema_ok(c) is False, f"expected schema-invalid: {c!r}"

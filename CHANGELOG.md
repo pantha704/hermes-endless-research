@@ -6,6 +6,15 @@ adheres to [Semantic Versioning](https://semver.org/) (with `v0.x` pre-1.0 seman
 
 ## [Unreleased]
 
+## [0.2.16] — 2026-08-06
+### Fixed (bool `rounds_completed` rejected in audit-event schema)
+Tiny schema-precision fix: `bool` is a subclass of `int` in Python, so a started event with
+`rounds_completed: true` slipped past the `int`-or-`null` check (unlike the completed-event
+counters, which already reject booleans). `_history_event_schema_ok()` now explicitly
+rejects a `bool` for `rounds_completed`, while still accepting a genuine integer `0`. The
+existing schema tests were extended with both the rejection case and a `rounds_completed: 0`
+positive case. Suite: 150, all green (incl. 3.9). Normal cron path unaffected.
+
 ## [0.2.15] — 2026-08-06
 ### Fixed (semantic audit-event schema validation — mirrors the v0.2.11 lease validator)
 - **`_history_event_schema_ok()`** validates each parsed journal row is a well-formed

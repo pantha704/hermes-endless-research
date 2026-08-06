@@ -536,7 +536,8 @@ def _history_event_schema_ok(event: object) -> bool:
         return False
     ev = event.get("event")
     if ev == "started":
-        if not isinstance(event.get("rounds_completed"), (int, type(None))):
+        rounds = event.get("rounds_completed")
+        if isinstance(rounds, bool) or not isinstance(rounds, (int, type(None))):
             return False
     elif ev == "completed":
         if event.get("checkpoint") is not None and not isinstance(event.get("checkpoint"), str):
