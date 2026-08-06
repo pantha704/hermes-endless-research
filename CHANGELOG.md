@@ -6,6 +6,23 @@ adheres to [Semantic Versioning](https://semver.org/) (with `v0.x` pre-1.0 seman
 
 ## [Unreleased]
 
+## [0.2.12] — 2026-08-06
+### Added (per-run audit journal — run-history.jsonl + `run` CLI)
+- **Append-only audit journal** `.research/run-history.jsonl`. `run start` / `run finish` /
+  `run abort` record lifecycle events carrying `campaign_run_id`, `hermes_session_id`
+  (auto-captured from `$HERMES_SESSION_ID`, overridable via `--session-id`), and
+  `cron_job_id`. `run audit [--json]` reconciles the journal (crashed start-only runs,
+  duplicate terminal events, counts). All writes go through `_owned_project_lock`.
+- **Checkpoints enriched** with `campaign_run_id`, `hermes_session_id`, and `cron_job_id`.
+- **Duplicate-start guard**: a second `run start` for an un-finished campaign_run_id is
+  refused (exit 4). Ownership is still enforced on every audit write (wrong `--run-id` →
+  exit 3).
+- **Purpose:** the campaign remains auditable even after Hermes prunes/archives older cron
+  sessions — each run maps to its exact Hermes session, campaign run, and cron job.
+- **Tests:** new `test_v212_audit.py` (9): session-id capture, start/finish linkage,
+  abort, ownership refusal (start & finish), crash start-only detection, audit JSON,
+  duplicate-start, checkpoint id linkage. Suite: 123 → **132**, all green (incl. 3.9).
+
 ## [0.2.11] — 2026-08-06
 ### Fixed (semantic lease-schema validation — fail-closed on malformed-but-valid JSON)
 The audit found the fail-closed reader only caught syntactically invalid JSON. A lease

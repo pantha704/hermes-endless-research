@@ -281,7 +281,15 @@ Two independent layers stop two ticks from mutating the same project:
    automatic ID allocation is collision-free and CLUE/DE nodes resolve in the evidence
    graph (no false "unknown node" / dangling-endpoint errors).
 
-Layer 1 is the primary overlap guard; layers 2-4 are belt-and-suspenders.
+5. **Per-run audit journal (v0.2.12).** Every research tick records append-only lifecycle
+   events in `.research/run-history.jsonl` via `run start` / `run finish` / `run abort`,
+   each carrying `campaign_run_id`, `hermes_session_id` (captured from `$HERMES_SESSION_ID`
+   so the run maps to its exact Hermes session even after session pruning), and
+   `cron_job_id`. `run audit [--json]` reconciles the journal (flags crashed start-only
+   runs and duplicate terminal events). Checkpoints also embed all three ids. This keeps
+   the campaign auditable independent of Hermes session retention.
+
+Layer 1 is the primary overlap guard; layers 2-5 are belt-and-suspenders.
 
 ## Cron campaign wiring — TWO jobs (the "until the end of the world" heartbeat)
 

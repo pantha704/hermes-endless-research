@@ -475,6 +475,179 @@ def cmd_reset(args) -> int:
     return 0
 
 
+def _hermes_session_id() -> str:
+    """The current Hermes session ID (exposed to tool subprocesses as $HERMES_SESSION_ID).
+
+    This lets every audit record associate itself with the exact Hermes session that
+    produced it, even when the database later prunes the full session. Falls back to ''.
+    """
+    return os.environ.get("HERMES_SESSION_ID", "")
+
+
+# ---------------------------------------------------------------------------
+# v0.2.12 — per-run audit journal (append-only .research/run-history.jsonl)
+# ---------------------------------------------------------------------------
+# Append-only lifecycle events rather than rewriting a single record, so a crash is
+# visible: a "started" event with no matching "completed"/"aborted" means the session
+# ended unexpectedly. Every event carries campaign_run_id + hermes_session_id so the
+# campaign remains auditable even after Hermes session pruning.
+
+AUDIT_SCHEMA = 1
+
+
+def _history_path(research: Path) -> Path:
+    return research / "run-history.jsonl"
+
+
+def _append_history_event(research: Path, event: dict) -> None:
+    with open(_history_path(research), "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(event) + "\n")
+
+
+def _load_history(research: Path):
+    rows = []
+    if _history_path(research).exists():
+        for line in _history_path(research).read_text().splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return rows
+
+
+def cmd_run_start(args) -> int:
+    """Record a 'started' audit event for this research run (append-only, locked)."""
+    research = Path(args.dir).expanduser().resolve() / ".research"
+    if not (research / "state.json").exists():
+        print("No state.json. Run `init` first.", file=sys.stderr)
+        return 1
+    events = _load_history(research)
+    # A live, un-finished run for the same campaign_run_id must not be double-started.
+    for ev in events:
+        if (ev.get("event") == "started"
+                and ev.get("campaign_run_id") == args.run_id
+                and not ev.get("terminal")):
+            print(f"REFUSED: run {args.run_id} already started with no terminal event.",
+                  file=sys.stderr)
+            return 4
+    try:
+        with _owned_project_lock(args) as owned:
+            if owned.exit_code:
+                return _owned_cm_fail(args, research, "run start", owned.exit_code)
+            event = {
+                "schema_version": AUDIT_SCHEMA,
+                "event": "started",
+                "campaign_run_id": args.run_id,
+                "hermes_session_id": _hermes_session_id() or args.session_id or "",
+                "cron_job_id": args.cron_job_id or "",
+                "timestamp": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "state": getattr(args, "state", ""),
+                "rounds_completed": getattr(args, "rounds", None),
+            }
+            _append_history_event(research, event)
+    except BlockingIOError:
+        return _owned_cm_fail(args, research, "run start", 2)
+    print(f"run started -> {_history_path(research)}")
+    return 0
+
+
+def cmd_run_finish(args) -> int:
+    """Record a 'completed' audit event closing a 'started' event (append-only, locked)."""
+    research = Path(args.dir).expanduser().resolve() / ".research"
+    if not (research / "state.json").exists():
+        print("No state.json. Run `init` first.", file=sys.stderr)
+        return 1
+    try:
+        with _owned_project_lock(args) as owned:
+            if owned.exit_code:
+                return _owned_cm_fail(args, research, "run finish", owned.exit_code)
+            event = {
+                "schema_version": AUDIT_SCHEMA,
+                "event": "completed",
+                "campaign_run_id": args.run_id,
+                "hermes_session_id": _hermes_session_id() or args.session_id or "",
+                "cron_job_id": args.cron_job_id or "",
+                "timestamp": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "checkpoint": args.checkpoint or "",
+                "state": getattr(args, "state", ""),
+                "sources_added": getattr(args, "sources", 0),
+                "claims_added": getattr(args, "claims", 0),
+                "edges_added": getattr(args, "edges", 0),
+                "next_clue": args.next_clue or "",
+                "result": args.result or "completed",
+            }
+            _append_history_event(research, event)
+    except BlockingIOError:
+        return _owned_cm_fail(args, research, "run finish", 2)
+    print(f"run completed -> {_history_path(research)}")
+    return 0
+
+
+def cmd_run_abort(args) -> int:
+    """Record an intentional 'aborted' terminal event (append-only, locked)."""
+    research = Path(args.dir).expanduser().resolve() / ".research"
+    if not (research / "state.json").exists():
+        print("No state.json. Run `init` first.", file=sys.stderr)
+        return 1
+    try:
+        with _owned_project_lock(args) as owned:
+            if owned.exit_code:
+                return _owned_cm_fail(args, research, "run abort", owned.exit_code)
+            event = {
+                "schema_version": AUDIT_SCHEMA,
+                "event": "aborted",
+                "campaign_run_id": args.run_id,
+                "hermes_session_id": _hermes_session_id() or args.session_id or "",
+                "cron_job_id": args.cron_job_id or "",
+                "timestamp": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "reason": args.reason or "",
+            }
+            _append_history_event(research, event)
+    except BlockingIOError:
+        return _owned_cm_fail(args, research, "run abort", 2)
+    print(f"run aborted -> {_history_path(research)}")
+    return 0
+
+
+def cmd_run_audit(args) -> int:
+    """Reconcile the run-history journal: crashed runs, dupes, linkage gaps."""
+    research = Path(args.dir).expanduser().resolve() / ".research"
+    events = _load_history(research)
+    started = [e for e in events if e.get("event") == "started"]
+    terminal_events = [e for e in events if e.get("event") in ("completed", "aborted")]
+    # Group started runs and find those with no terminal event (crashed).
+    run_ids = sorted({e.get("campaign_run_id") for e in started if e.get("campaign_run_id")})
+    crashed = []
+    for rid in run_ids:
+        if not any(e.get("event") in ("completed", "aborted") and e.get("campaign_run_id") == rid
+                   for e in events):
+            crashed.append(rid)
+    dup_finish = [e.get("campaign_run_id") for e in terminal_events
+                  if e.get("campaign_run_id") and
+                  sum(1 for x in events if x.get("event") == e.get("event")
+                      and x.get("campaign_run_id") == e.get("campaign_run_id")) > 1]
+    summary = {
+        "runs_started": len(started),
+        "runs_completed": sum(1 for e in events if e.get("event") == "completed"),
+        "runs_aborted": sum(1 for e in events if e.get("event") == "aborted"),
+        "crashed_start_only": crashed,
+        "duplicate_terminal_events": sorted(set(dup_finish)),
+        "events_total": len(events),
+    }
+    if getattr(args, "json", False):
+        print(json.dumps(summary, indent=2))
+    else:
+        print("== run audit ==")
+        for k, v in summary.items():
+            print(f"  {k}: {v}")
+        if crashed:
+            print("  WARNING: start-only (crashed) runs →", crashed)
+    return 0
+
+
 def cmd_checkpoint(args) -> int:
     proj = Path(args.dir).expanduser().resolve()
     research = proj / ".research"
@@ -492,6 +665,10 @@ def cmd_checkpoint(args) -> int:
             state = json.loads(state_f.read_text())
             body = f"# Checkpoint {ts}\n\nstate       : {state.get('current_state')}\n"
             body += f"next_action : {state.get('next_action')}\nnote        : {args.note or ''}\n"
+            # v0.2.12 — link the checkpoint back to its run/session/cron for auditability.
+            body += f"campaign_run_id  : {getattr(args, 'run_id', '') or ''}\n"
+            body += f"hermes_session_id: {_hermes_session_id()}\n"
+            body += f"cron_job_id      : {getattr(args, 'cron_job_id', '') or ''}\n"
             cp.write_text(body)
             state["last_checkpoint"] = str(cp.relative_to(research))
             state_f.write_text(json.dumps(state, indent=2))
@@ -1798,6 +1975,44 @@ def main(argv=None) -> int:
     pc.add_argument("--run-id", default=None, help="prove ownership of the active worker lease")
     pc.add_argument("--operator-override", action="store_true", help="force a manual write despite a live lease (emergency)")
     pc.set_defaults(fn=cmd_checkpoint)
+
+    pr = sub.add_parser("run", help="per-run audit journal (start/finish/abort/audit)")
+    rsub = pr.add_subparsers(dest="run_op", required=True)
+    rstart = rsub.add_parser("start", help="record a 'started' audit event")
+    rstart.add_argument("dir")
+    rstart.add_argument("--run-id", required=True)
+    rstart.add_argument("--cron-job-id", default=None)
+    rstart.add_argument("--state", default=None)
+    rstart.add_argument("--rounds", type=int, default=None)
+    rstart.add_argument("--session-id", default=None, help="override HERMES_SESSION_ID (tests/admin)")
+    rstart.add_argument("--lock-timeout", dest="lock_timeout", type=float, default=10)
+    rstart.set_defaults(fn=cmd_run_start)
+    rfin = rsub.add_parser("finish", help="record a 'completed' audit event")
+    rfin.add_argument("dir")
+    rfin.add_argument("--run-id", required=True)
+    rfin.add_argument("--cron-job-id", default=None)
+    rfin.add_argument("--checkpoint", default=None)
+    rfin.add_argument("--state", default=None)
+    rfin.add_argument("--sources", type=int, default=0)
+    rfin.add_argument("--claims", type=int, default=0)
+    rfin.add_argument("--edges", type=int, default=0)
+    rfin.add_argument("--next-clue", default=None)
+    rfin.add_argument("--result", default="completed")
+    rfin.add_argument("--session-id", default=None)
+    rfin.add_argument("--lock-timeout", dest="lock_timeout", type=float, default=10)
+    rfin.set_defaults(fn=cmd_run_finish)
+    rab = rsub.add_parser("abort", help="record an intentional 'aborted' event")
+    rab.add_argument("dir")
+    rab.add_argument("--run-id", required=True)
+    rab.add_argument("--cron-job-id", default=None)
+    rab.add_argument("--reason", default=None)
+    rab.add_argument("--session-id", default=None)
+    rab.add_argument("--lock-timeout", dest="lock_timeout", type=float, default=10)
+    rab.set_defaults(fn=cmd_run_abort)
+    raud = rsub.add_parser("audit", help="reconcile run history (crashed/duplicate)")
+    raud.add_argument("dir")
+    raud.add_argument("--json", action="store_true")
+    raud.set_defaults(fn=cmd_run_audit)
 
     pt = sub.add_parser("tick", help="run ONE research tick under the atomic project lock")
     pt.add_argument("dir")
