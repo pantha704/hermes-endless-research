@@ -144,6 +144,16 @@ WEIGHTS = {
 }
 STATES = {"CONTINUE", "CHECKPOINT", "BLOCKED", "EXHAUSTED", "SUCCESS", "DORMANT"}
 
+# v0.3.0 — single canonical human/review-aware state (locked decision #3).
+CAMPAIGN_STATES = {
+    "CONTINUE", "BLOCKED", "DORMANT", "AWAITING_REVIEW",
+    "ACCEPTED", "EXHAUSTED", "PAUSED", "ERROR",
+}
+# States in which a research session should stop and hand control to the human.
+CAMPAIGN_STOP_STATES = {"AWAITING_REVIEW", "ACCEPTED", "DORMANT", "PAUSED", "ERROR", "EXHAUSTED"}
+# RESEARCH_SUCCESS is an EVENT, not a state: key for the audit journal.
+EVENT_RESEARCH_SUCCESS = "RESEARCH_SUCCESS"
+
 TEMPLATES = {
     "objective.md": """# Objective
 
@@ -410,6 +420,15 @@ def cmd_resignal(args) -> int:
                 return _owned_cm_fail(args, owned.research, "resignal", owned.exit_code)
             state = json.loads(state_f.read_text())
             prev = state.get("current_state", "CONTINUE")
+            # v0.3.0: canonical single campaign_state, synchronized with legacy current_state.
+            state["objective_version"] = state.get("objective_version", 1)
+            state["criteria_version"] = state.get("criteria_version", 1)
+            if st == "SUCCESS":
+                state["campaign_state"] = "AWAITING_REVIEW"   # research done, human gate open
+            elif st in CAMPAIGN_STATES:
+                state["campaign_state"] = st
+            else:
+                state["campaign_state"] = state.get("campaign_state", "CONTINUE")
             state["current_state"] = st
             state["state_updated"] = _now()
             if args.note:
@@ -418,6 +437,26 @@ def cmd_resignal(args) -> int:
                     bl = state.setdefault("blockers", [])
                     if args.note not in bl:
                         bl.append(args.note)
+            # RESEARCH_SUCCESS is an IMMUTABLE audit event tied to the passing versions.
+            if st == "SUCCESS":
+                _append_history_event(owned.research, {
+                    "schema_version": AUDIT_SCHEMA,
+                    "event": EVENT_RESEARCH_SUCCESS,
+                    "campaign_run_id": getattr(args, "run_id", "") or "",
+                    "hermes_session_id": _hermes_session_id(),
+                    "cron_job_id": getattr(args, "cron_job_id", "") or "",
+                    "timestamp": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "objective_version": state["objective_version"],
+                    "criteria_version": state["criteria_version"],
+                })
+                # Freeze the v1 snapshots (immutable) so SUCCESS #1 is tied to a stable v1.
+                research_dir = owned.research
+                obj_pre = research_dir / "objective.md"
+                c_pre = research_dir / "criteria.jsonl"
+                if obj_pre.exists():
+                    _snapshot_active(research_dir, "objective", obj_pre.read_text())
+                if c_pre.exists():
+                    _snapshot_active(research_dir, "criteria", c_pre.read_text())
             state_f.write_text(json.dumps(state, indent=2))
     except BlockingIOError:
         return _owned_cm_fail(args, proj / ".research", "resignal", 2)
@@ -774,6 +813,167 @@ def cmd_run_audit(args) -> int:
             print("  WARNING: start-only (crashed) runs →", crashed)
         if corrupt_lines:
             print("  WARNING: corrupt journal lines →", corrupt_lines)
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# v0.3.0 Phase 1 — versioned objectives/criteria + human review states
+# ---------------------------------------------------------------------------
+# Canonical state is the single `campaign_state` enum. RESEARCH_SUCCESS is an immutable
+# AUDIT EVENT tied to the exact objective_version + criteria_version that passed, not a
+# writable state. Active `objective.md`/`criteria.jsonl` stay in place; immutable snapshots
+# live under versions/. Every human REFINE is one lock-protected transaction and is logged
+# verbatim to refinements.jsonl.
+
+def _next_version(research: Path, kind: str) -> int:
+    """Return the next version number (1-based) for objective|criteria snapshots.
+    `kind` is "objective" or "criteria"."""
+    d = research / "versions" / kind
+    pat = "v*.md" if kind == "objective" else "v*.jsonl"
+    nums = [int(p.stem[1:]) for p in d.glob(pat) if p.stem[1:].isdigit()]
+    return (max(nums) if nums else 0) + 1
+
+
+def _latest_snapshot(research: Path, kind: str, v: int):
+    """Read the snapshot at version v (or None). `kind` objective|criteria."""
+    ext = "md" if kind == "objective" else "jsonl"
+    f = research / "versions" / kind / f"v{v:04d}.{ext}"
+    return f.read_text() if f.exists() else None
+
+
+def _snapshot_active(research: Path, kind: str, text: str) -> int:
+    """Write an immutable snapshot of the current active objective.md/criteria.jsonl and
+    return its version number.
+
+    Idempotent: if the highest existing snapshot already has EXACTLY this content, return
+    its version (no duplicate snapshot). Otherwise write the next version and return it.
+    Never overwrites an existing snapshot (byte-preserving).
+    """
+    v = _next_version(research, kind)
+    # If the newest snapshot already matches the text, it's already frozen -> return it.
+    latest = _latest_snapshot(research, kind, v - 1) if v > 1 else None
+    if latest is not None and latest == text:
+        return v - 1
+    d = research / "versions" / kind
+    d.mkdir(parents=True, exist_ok=True)
+    ext = "md" if kind == "objective" else "jsonl"
+    f = d / f"v{v:04d}.{ext}"
+    f.write_text(text)
+    return v
+
+
+def cmd_review(args) -> int:
+    """Human-in-the-loop review command: ACCEPT | REFINE | STATUS.
+
+    ACCEPT  — mark the campaign complete (ACCEPTED), only from AWAITING_REVIEW.
+    REFINE  — create the next objective/criteria version + frontier work, return to CONTINUE,
+              one lock-protected transaction; only from AWAITING_REVIEW.
+    STATUS  — report campaign_state + versions (no mutation).
+    """
+    op = (args.review_op or "STATUS").upper()
+    proj = Path(args.dir).expanduser().resolve()
+    research = proj / ".research"
+    state_f = research / "state.json"
+    if not state_f.exists():
+        print("No state.json. Run `init` first.", file=sys.stderr)
+        return 1
+
+    if op == "STATUS":
+        state = json.loads(state_f.read_text())
+        print("== review status ==")
+        print(f"  campaign_state   : {state.get('campaign_state', '(unset)')}")
+        print(f"  current_state    : {state.get('current_state', '(unset)')}  (legacy)")
+        print(f"  objective_version: {state.get('objective_version', 1)}")
+        print(f"  criteria_version : {state.get('criteria_version', 1)}")
+        return 0
+
+    try:
+        with _owned_project_lock(args) as owned:
+            if owned.exit_code:
+                return _owned_cm_fail(args, research, "review", owned.exit_code)
+            state = json.loads(state_f.read_text())
+            cur = state.get("campaign_state", state.get("current_state", "CONTINUE"))
+            if cur != "AWAITING_REVIEW":
+                print(f"REFUSED: review {op} only allowed from AWAITING_REVIEW "
+                      f"(currently {cur}).", file=sys.stderr)
+                return 3
+
+            if op == "ACCEPT":
+                state["campaign_state"] = "ACCEPTED"
+                state["current_state"] = "ACCEPTED"   # legacy derived
+                state["state_updated"] = _now()
+                state_f.write_text(json.dumps(state, indent=2))
+                print("Campaign ACCEPTED — complete.")
+                return 0
+
+            # ---- REFINE (one lock-protected transaction) ----
+            obj_pre = (research / "objective.md")
+            c_pre = (research / "criteria.jsonl")
+            old_obj = obj_pre.read_text() if obj_pre.exists() else ""
+            old_crit = c_pre.read_text() if c_pre.exists() else ""
+            old_obj_v = state.get("objective_version", 1)
+            old_crit_v = state.get("criteria_version", 1)
+
+            # 1) snapshot old (immutable, non-destructive)
+            snap_obj_v = _snapshot_active(research, "objective", old_obj)
+            snap_crit_v = _snapshot_active(research, "criteria", old_crit)
+
+            # 2) construct new version: carry forward criteria (append), optional new objective
+            new_obj_v = snap_obj_v + 1
+            new_crit_v = snap_crit_v + 1
+            if getattr(args, "objective_text", None):
+                obj_f = research / "versions" / "objective" / f"v{new_obj_v:04d}.md"
+                obj_f.write_text(args.objective_text)
+                obj_pre.write_text(args.objective_text)
+            # objective carries forward (unchanged) if no new text; still bumps version? No —
+            # only bump objective version if text changed. Keep it same as snapshot if no text.
+            if not getattr(args, "objective_text", None):
+                new_obj_v = snap_obj_v
+
+            # criteria: active file gains any new criterion lines
+            new_crit_lines = list(old_crit.splitlines())
+            for c in (getattr(args, "criteria", None) or []):
+                if c.strip():
+                    new_crit_lines.append(c.strip())
+            new_crit_text = "\n".join(new_crit_lines) + ("\n" if new_crit_lines else "")
+            c_f = research / "versions" / "criteria" / f"v{new_crit_v:04d}.jsonl"
+            c_f.write_text(new_crit_text)
+            c_pre.write_text(new_crit_text)
+
+            # 3) record user feedback verbatim
+            ref = {
+                "timestamp": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "feedback": args.feedback or "",
+                "old_objective_version": old_obj_v,
+                "new_objective_version": new_obj_v,
+                "old_criteria_version": old_crit_v,
+                "new_criteria_version": new_crit_v,
+                "frontier_added": getattr(args, "frontier_add", None) or None,
+            }
+            with open(research / "refinements.jsonl", "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(ref) + "\n")
+
+            # 4) add/activate frontier work (verbatim clues) — already inside the lock, so
+            # append directly (a nested lock would deadlock).
+            for clue in (getattr(args, "frontier_add", None) or []):
+                if clue.strip():
+                    with open(research / "frontier.jsonl", "a", encoding="utf-8") as fh:
+                        fh.write(json.dumps({"clue_id": None, "description": clue.strip(),
+                                             "status": "pending", "attempts": 0}) + "\n")
+
+            # 5) set back to CONTINUE
+            state["campaign_state"] = "CONTINUE"
+            state["current_state"] = "CONTINUE"   # legacy derived
+            state["objective_version"] = new_obj_v
+            state["criteria_version"] = new_crit_v
+            state["state_updated"] = _now()
+            state_f.write_text(json.dumps(state, indent=2))
+    except BlockingIOError:
+        return _owned_cm_fail(args, research, "review", 2)
+    if op == "ACCEPT":
+        return 0
+    print(f"REFINED: objective v{old_obj_v}->{new_obj_v}, criteria v{old_crit_v}->{new_crit_v}; "
+          f"campaign → CONTINUE.")
     return 0
 
 
@@ -2096,6 +2296,22 @@ def main(argv=None) -> int:
                      help="force a reset despite a live worker lease (emergency)")
     prs.add_argument("--lock-timeout", dest="lock_timeout", type=float, default=10)
     prs.set_defaults(fn=cmd_reset)
+
+    prev = sub.add_parser("review", help="human review: ACCEPT | REFINE | STATUS")
+    prev.add_argument("dir")
+    prev.add_argument("review_op", nargs="?", default="STATUS",
+                      help="ACCEPT | REFINE | STATUS (default STATUS)")
+    prev.add_argument("--feedback", default=None, help="verbatim human REFINE feedback")
+    prev.add_argument("--objective-text", default=None, help="new objective text (optional)")
+    prev.add_argument("--criteria", action="append", default=[],
+                      help="additional criterion line(s); repeatable")
+    prev.add_argument("--frontier-add", action="append", default=[],
+                      help="new clue description(s); repeatable")
+    prev.add_argument("--run-id", default=None, help="prove ownership of the active worker lease")
+    prev.add_argument("--operator-override", action="store_true",
+                      help="force a review despite a live worker lease (emergency)")
+    prev.add_argument("--lock-timeout", dest="lock_timeout", type=float, default=10)
+    prev.set_defaults(fn=cmd_review)
 
     pc = sub.add_parser("checkpoint", help="snapshot now")
     pc.add_argument("dir")
