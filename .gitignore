@@ -20,3 +20,9 @@ dist/
 *.log
 .DS_Store
 RELEASE-REPORT.md
+
+# ---- gitnexus (local code-graph index + generated context files) ----
+.gitnexus/
+CLAUDE.md
+AGENTS.md
+.claude/
